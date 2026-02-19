@@ -1,0 +1,71 @@
+{
+  "hostSubmitter": {
+    "establishmentNameEN": "Rayna Tourism LLC",
+    "establishmentNo": "",
+    "emirate": "Dubai",
+    "activity": "",
+    "addressEN": "",
+    "poBox": "",
+    "email": "smartc.rayna@gmail.com",
+    "mobileNumber": "0565337921"
+  },
+
+  "visit": {
+    "purposeOfVisit": "Tourism",
+    "dateOfArrival": "",
+    "dateOfDeparture": "",
+    "portOfEntry": "",
+    "accommodationType": "",
+    "hotelOrPlaceOfStay": ""
+  },
+
+  "passport": {
+    "passportType": "Normal",
+    "passportNumber": "",
+    "currentNationality": "",
+    "previousNationality": "",
+    "fullNameEN": "",
+    "firstName": "",
+    "middleName": "",
+    "lastName": "",
+    "dateOfBirth": "",
+    "birthCountry": "",
+    "birthPlaceEN": "",
+    "gender": "Male",
+    "passportIssueCountry": "",
+    "passportIssueDate": "",
+    "passportExpiryDate": "",
+    "passportPlaceOfIssueEN": ""
+  },
+
+  "applicant": {
+    "isInsideUAE": false,
+    "motherNameEN": "MRS",
+    "motherNameAR": "",
+    "maritalStatus": "UNSPECIFIC",
+    "relationshipToHost": "Not Related",
+    "religion": "CHRISTIAN",
+    "faith": "Unknown",
+    "education": "UNIVERSITY DEGREE",
+    "profession": "SALES EXECUTIVE",
+    "firstLanguage": "ENGLISH",
+    "comingFromCountry": ""
+  },
+
+  "contact": {
+    "email": "smartc.rayna@gmail.com",
+    "mobileNumber": "0565337921",
+    "approvalEmailCopy": "",
+    "preferredSMSLanguage": "ENGLISH",
+    "uaeEmirate": "Dubai",
+    "uaeCity": "Dubai"
+  },
+
+  "documents": {
+    "sponsoredPassportPage1": "data/passports/Sponsored Passport page 1.png",
+    "passportExternalCoverPage": "data/passports/passport-cover.jpg",
+    "personalPhoto": "data/passports/photo.jpg",
+    "hotelReservationPage1": "data/documents/hotel-reservation.pdf",
+    "returnAirTicketPage1": "data/documents/return-ticket.pdf"
+  }
+}
