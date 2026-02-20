@@ -115,8 +115,19 @@ export interface ContactDetails {
   mobileNumber: string;
   approvalEmailCopy?: string;
   preferredSMSLanguage: 'ENGLISH' | 'ARABIC';
-  uaeEmirate: string;               // Address Inside UAE - Emirate
-  uaeCity: string;                  // Address Inside UAE - City
+  // Address Inside UAE
+  uaeEmirate: string;               // Select: ABU DHABI, DUBAI, SHARJAH, etc.
+  uaeCity: string;                  // Select: populated after Emirate AJAX
+  uaeArea?: string;                 // Select: populated after City AJAX
+  uaeStreet?: string;               // Text input
+  uaeBuilding?: string;             // Text input (Building/Villa)
+  uaeFloor?: string;                // Text input
+  uaeFlat?: string;                 // Text input (Flat/Villa no.)
+  // Address Outside UAE
+  outsideCountry?: string;          // Select: cmbApplicantOutsideCountry (country code or name)
+  outsideMobile?: string;           // Text input: inpAddressOutsideMobileNumber
+  outsideCity?: string;             // Text input: inpAddressOutsideCity
+  outsideAddress?: string;          // Text input: inpAddressOutsideAddress1
 }
 
 // ─── Documents to Upload ──────────────────────────────────────────────────────

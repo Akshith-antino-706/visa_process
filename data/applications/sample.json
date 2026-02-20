@@ -57,8 +57,17 @@
     "mobileNumber": "0565337921",
     "approvalEmailCopy": "",
     "preferredSMSLanguage": "ENGLISH",
-    "uaeEmirate": "Dubai",
-    "uaeCity": "Dubai"
+    "uaeEmirate": "DUBAI",
+    "uaeCity": "Dubai",
+    "uaeArea": "DEIRA",
+    "uaeStreet": "AL RIGGA",
+    "uaeBuilding": "RAYNA TOURISM",
+    "uaeFloor": "1",
+    "uaeFlat": "101",
+    "outsideCountry": "",
+    "outsideMobile": "00000",
+    "outsideCity": "",
+    "outsideAddress": ""
   },
 
   "documents": {

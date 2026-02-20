@@ -11,7 +11,7 @@ export default defineConfig({
   workers: 1,                 // Single worker to avoid overlapping sessions
   reporter: 'html',
 
-  timeout: 120_000,          // 2 minutes per test (form fill can be slow)
+  timeout: 600_000,          // 10 minutes per test (form fill + document upload + pauses)
   use: {
     trace: 'on-first-retry',
     headless: false,           // Always headed — needed for form visibility
@@ -20,6 +20,7 @@ export default defineConfig({
       args: ['--start-maximized'],  // Start Chrome maximized (full screen)
     },
     screenshot: 'only-on-failure',
+    video: 'on',              // Record video of every test run
     actionTimeout: 20_000,    // 20 s per individual action/click
   },
 
