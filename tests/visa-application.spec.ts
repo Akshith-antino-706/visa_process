@@ -8,6 +8,7 @@
  * Usage: npm test
  */
 
+import 'dotenv/config';
 import { WebDriver } from 'selenium-webdriver';
 import * as fs from 'fs';
 import * as path from 'path';

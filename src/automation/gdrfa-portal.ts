@@ -8,6 +8,7 @@ import {
   ContactDetails,
   ApplicationDocuments,
 } from '../types/application-data';
+import { matchDocumentsToSlots, matchDocumentsToSlotsLocal } from '../utils/doc-matcher';
 
 // ─── Page Object ──────────────────────────────────────────────────────────────
 
@@ -180,453 +181,471 @@ export class GdrfaPortalPage {
     return appNo;
   }
 
+  /**
+   * Uploads documents using OpenAI for intelligent file-to-slot matching,
+   * then drag-and-drop simulation to upload each file.
+   */
   async uploadDocuments(docs: ApplicationDocuments): Promise<void> {
     console.log('[Upload] Starting document upload...');
     await this.waitForPageLoad();
     await this.sleep(3000);
 
-    // Discover what upload elements exist on the page
-    const pageInfo = await this.driver.executeScript<{
-      fileInputs: Array<{ id: string; name: string; attrs: Record<string, string> }>;
-      uploadZones: string[];
-      labels: string[];
-    }>(`
-      var result = { fileInputs: [], uploadZones: [], labels: [] };
-      // All file inputs
-      document.querySelectorAll('input[type="file"]').forEach(function(el) {
-        var attrs = {};
-        for (var i = 0; i < el.attributes.length; i++) {
-          attrs[el.attributes[i].name] = el.attributes[i].value;
-        }
-        result.fileInputs.push({ id: el.id || '', name: el.name || '', attrs: attrs });
-      });
-      // Upload zones / dropzones
-      document.querySelectorAll('[class*="upload"], [class*="dropzone"], [class*="Upload"], [class*="Dropzone"]').forEach(function(el) {
-        result.uploadZones.push(el.className + ' | ' + (el.textContent || '').substring(0, 80).trim());
-      });
-      // Labels that mention document types
-      document.querySelectorAll('label, span.upload-label, .document-label, td, th').forEach(function(el) {
-        var t = (el.textContent || '').trim();
-        if (t && (t.indexOf('Passport') >= 0 || t.indexOf('Photo') >= 0 || t.indexOf('Hotel') >= 0
-            || t.indexOf('ticket') >= 0 || t.indexOf('Ticket') >= 0 || t.indexOf('reservation') >= 0
-            || t.indexOf('Upload') >= 0 || t.indexOf('Attach') >= 0 || t.indexOf('Document') >= 0)) {
-          result.labels.push(t.substring(0, 120));
-        }
-      });
-      return result;
-    `);
-
-    console.log(`[Upload] File inputs found: ${pageInfo.fileInputs.length}`);
-    for (const fi of pageInfo.fileInputs) {
-      console.log(`  - id="${fi.id}" name="${fi.name}" attrs=${JSON.stringify(fi.attrs)}`);
-    }
-    if (pageInfo.uploadZones.length > 0) {
-      console.log(`[Upload] Upload zones: ${pageInfo.uploadZones.length}`);
-      for (const uz of pageInfo.uploadZones.slice(0, 10)) {
-        console.log(`  - ${uz}`);
-      }
-    }
-    if (pageInfo.labels.length > 0) {
-      console.log(`[Upload] Document labels found:`);
-      for (const lbl of pageInfo.labels.slice(0, 15)) {
-        console.log(`  - ${lbl}`);
-      }
-    }
-
-    // Map document labels to file paths — primary slots first, then Others fallback
-    const slots: Array<{ label: string; keywords: string[]; file: string }> = [
-      { label: 'Sponsored Passport page 1',                keywords: ['sponsored', 'passport page', 'passport page 1'], file: docs.sponsoredPassportPage1 },
-      { label: 'Passport External Cover Page',             keywords: ['cover', 'external cover'],                       file: docs.passportExternalCoverPage },
-      { label: 'Personal Photo',                           keywords: ['photo', 'personal photo'],                       file: docs.personalPhoto },
-      { label: 'Hotel reservation/Place of stay - Page 1', keywords: ['hotel', 'reservation', 'place of stay'],         file: docs.hotelReservationPage1 },
-      { label: 'Return air ticket - Page 1',               keywords: ['ticket', 'air ticket', 'return'],                file: docs.returnAirTicketPage1 },
-    ];
-
-    // Build a list of available data-document-types on the page
-    const availableTypes = await this.driver.executeScript<string[]>(`
+    // List available upload slots on the page
+    const availableSlots = await this.driver.executeScript<string[]>(`
       return Array.from(document.querySelectorAll('input[type="file"][data-document-type]'))
         .map(function(el) { return el.getAttribute('data-document-type') || ''; });
     `);
-    console.log('[Upload] Available upload slot types:', availableTypes);
+    console.log('[Upload] Available slots:', availableSlots);
 
-    // If hotel/flight slots don't exist, try uploading to "Others Page 1" and "Others Page 2"
-    const hotelSlotExists = availableTypes.some(t => t.toLowerCase().includes('hotel') || t.toLowerCase().includes('reservation'));
-    const ticketSlotExists = availableTypes.some(t => t.toLowerCase().includes('ticket') || t.toLowerCase().includes('air ticket'));
+    // Collect all document file paths from the ApplicationDocuments
+    const allDocPaths: string[] = [
+      docs.sponsoredPassportPage1,
+      docs.passportExternalCoverPage,
+      docs.personalPhoto,
+      docs.hotelReservationPage1,
+      docs.returnAirTicketPage1,
+      docs.hotelReservationPage2 || '',
+      docs.othersPage1 || '',
+      docs.returnAirTicketPage2 || '',
+      ...(docs.sponsoredPassportPages || []),
+    ].filter(Boolean);
 
-    if (!hotelSlotExists && docs.hotelReservationPage1) {
-      console.log('[Upload] No hotel slot found — will try "Others Page 1"');
-      // Replace the hotel slot to target "Others Page 1"
-      const hotelIdx = slots.findIndex(s => s.label.includes('Hotel'));
-      if (hotelIdx >= 0) {
-        slots[hotelIdx] = { label: 'Others Page 1', keywords: ['others page 1', 'others'], file: docs.hotelReservationPage1 };
-      }
+    // Get the documents folder from the first valid path
+    let docsFolder = '';
+    for (const p of allDocPaths) {
+      if (p) { docsFolder = path.dirname(path.resolve(p)); break; }
     }
-    if (!ticketSlotExists && docs.returnAirTicketPage1) {
-      console.log('[Upload] No ticket slot found — will try "Others Page 2"');
-      const ticketIdx = slots.findIndex(s => s.label.includes('Return'));
-      if (ticketIdx >= 0) {
-        slots[ticketIdx] = { label: 'Others Page 2', keywords: ['others page 2', 'others'], file: docs.returnAirTicketPage1 };
-      }
+
+    // List ALL files in the documents folder (not just the ones mapped by excel-reader)
+    let allFileNames: string[] = [];
+    if (docsFolder && fs.existsSync(docsFolder)) {
+      allFileNames = fs.readdirSync(docsFolder)
+        .filter(f => !f.startsWith('.') && f !== 'desktop.ini');
+      console.log(`[Upload] Files in folder: ${allFileNames.join(', ')}`);
     }
 
-    if (pageInfo.fileInputs.length === 0) {
-      // No file inputs found — try to find them inside iframes
-      console.log('[Upload] No file inputs in main page — checking iframes...');
-      const iframes = await this.driver.findElements(By.css('iframe'));
-      for (let i = 0; i < iframes.length; i++) {
-        try {
-          await this.driver.switchTo().frame(iframes[i]);
-          const iframeInputs = await this.driver.findElements(By.css('input[type="file"]'));
-          if (iframeInputs.length > 0) {
-            console.log(`[Upload] Found ${iframeInputs.length} file input(s) in iframe ${i}`);
-            // Upload from within this iframe
-            await this.uploadInCurrentContext(slots);
-            await this.driver.switchTo().defaultContent();
-            console.log('[Upload] Iframe uploads complete.');
-            return;
-          }
-          await this.driver.switchTo().defaultContent();
-        } catch {
-          try { await this.driver.switchTo().defaultContent(); } catch {}
-        }
-      }
+    // Use OpenAI to intelligently match files to upload slots
+    let docMap: Array<{ label: string; file: string }> = [];
+    const applicantName = docsFolder.split(path.sep).pop() || 'Unknown';
 
-      // Still no inputs — try clicking upload/attach buttons first
-      console.log('[Upload] No file inputs in iframes either. Looking for upload buttons...');
-      await this.driver.executeScript(`
-        var btns = document.querySelectorAll('a, button, input[type="button"]');
-        for (var i = 0; i < btns.length; i++) {
-          var t = (btns[i].textContent || btns[i].value || '').trim().toLowerCase();
-          if (t.indexOf('upload') >= 0 || t.indexOf('attach') >= 0 || t.indexOf('browse') >= 0) {
-            console.log('Clicking: ' + t);
-          }
-        }
-      `);
-      console.warn('[Upload] Could not find any file upload mechanism on the page.');
-      // Take a diagnostic screenshot
+    if (allFileNames.length > 0 && availableSlots.length > 0) {
       try {
-        const screenshot = await this.driver.takeScreenshot();
-        const ssPath = path.resolve('test-results', 'upload-page-debug.png');
-        fs.mkdirSync(path.dirname(ssPath), { recursive: true });
-        fs.writeFileSync(ssPath, screenshot, 'base64');
-        console.log(`[Upload] Debug screenshot saved: ${ssPath}`);
-      } catch {}
-      return;
+        console.log('[Upload] Using OpenAI to match documents to slots...');
+        const aiMatches = await matchDocumentsToSlots(allFileNames, availableSlots, applicantName);
+
+        if (aiMatches.length > 0) {
+          docMap = aiMatches.map(m => ({
+            label: m.slotLabel,
+            file: path.join(docsFolder, m.fileName),
+          }));
+        } else {
+          throw new Error('No AI matches returned');
+        }
+      } catch (error) {
+        console.warn(`[Upload] OpenAI matching failed: ${error}. Using local fallback.`);
+        const localMatches = matchDocumentsToSlotsLocal(allFileNames, availableSlots);
+        docMap = localMatches.map(m => ({
+          label: m.slotLabel,
+          file: path.join(docsFolder, m.fileName),
+        }));
+      }
     }
 
-    // Upload using the discovered file inputs
-    await this.uploadInCurrentContext(slots);
+    // If no matches from LLM/local, fall back to the hardcoded map
+    if (docMap.length === 0) {
+      console.log('[Upload] Using hardcoded document map...');
+      docMap = [
+        { label: 'Sponsored Passport page 1',   file: docs.sponsoredPassportPage1 },
+        { label: 'Passport External Cover Page', file: docs.passportExternalCoverPage },
+        { label: 'Personal Photo',               file: docs.personalPhoto },
+      ];
+      if (docs.hotelReservationPage1) {
+        docMap.push({ label: 'Hotel reservation/Place of stay - Page 1', file: docs.hotelReservationPage1 });
+      }
+      if (docs.returnAirTicketPage1) {
+        docMap.push({ label: 'Return air ticket - Page 1', file: docs.returnAirTicketPage1 });
+      }
 
-    // Take a screenshot to verify uploads
+      // Check if hotel/flight slots exist — if not, remap to Others
+      const hasHotelSlot = availableSlots.some(s => s.toLowerCase().includes('hotel'));
+      const hasTicketSlot = availableSlots.some(s => s.toLowerCase().includes('ticket'));
+
+      if (!hasHotelSlot && docs.hotelReservationPage1) {
+        const idx = docMap.findIndex(d => d.label.includes('Hotel'));
+        if (idx >= 0) docMap[idx].label = 'Others Page 1';
+        console.log('[Upload] No hotel slot → using "Others Page 1"');
+      }
+      if (!hasTicketSlot && docs.returnAirTicketPage1) {
+        const idx = docMap.findIndex(d => d.label.includes('Return'));
+        if (idx >= 0) docMap[idx].label = 'Others Page 2';
+        console.log('[Upload] No ticket slot → using "Others Page 2"');
+      }
+    }
+
+    // Upload each document
+    for (const doc of docMap) {
+      if (!doc.file) continue;
+      const filePath = path.resolve(doc.file);
+      if (!fs.existsSync(filePath)) {
+        console.warn(`[Upload] File not found: ${filePath}`);
+        continue;
+      }
+      await this.uploadSingleDocument(doc.label, filePath);
+    }
+
+    console.log('[Upload] All documents processed. Waiting for page...');
+    await this.sleep(5000);
+
+    // Take screenshot after uploads
     try {
       const screenshot = await this.driver.takeScreenshot();
       const ssPath = path.resolve('test-results', 'after-upload.png');
       fs.mkdirSync(path.dirname(ssPath), { recursive: true });
       fs.writeFileSync(ssPath, screenshot, 'base64');
-      console.log(`[Upload] Post-upload screenshot: ${ssPath}`);
+      console.log(`[Upload] Screenshot: ${ssPath}`);
     } catch {}
 
-    console.log('[Upload] All documents uploaded. Waiting before Continue...');
-    await this.sleep(5000);
-
-    // Look for Continue button — OutSystems uses various patterns
-    await this.clickContinueButton();
+    // Click Continue
+    await this.clickUploadContinue();
   }
 
   /**
-   * Finds and clicks the Continue button on the upload/attachments page.
-   * Tries multiple selector strategies for OutSystems portal.
+   * Uploads a single document using the drag-and-drop simulation approach:
+   * 1. Finds the drop zone for this document type
+   * 2. Creates a hidden file input via JS
+   * 3. Sends the file path via Selenium sendKeys
+   * 4. Simulates drag-and-drop events (dragenter, dragover, drop) on the drop zone
+   * 5. Waits for the preview to appear
    */
-  private async clickContinueButton(): Promise<void> {
-    const strategies = [
-      // OutSystems common button patterns
-      `input[value="Continue"]`,
-      `input[value="continue"]`,
-      `a[id*="Continue"], a[id*="continue"]`,
-      `input[id*="Continue"], input[id*="continue"]`,
-      `button[id*="Continue"], button[id*="continue"]`,
-      // Static ID patterns
-      `[data-staticid*="Continue"], [data-staticid*="continue"]`,
-      `[staticid*="Continue"], [staticid*="continue"]`,
-      // By text content via XPath is not CSS — handle separately
-    ];
+  private async uploadSingleDocument(docType: string, filePath: string): Promise<void> {
+    console.log(`[Upload] "${docType}" → ${path.basename(filePath)}`);
 
-    for (const selector of strategies) {
-      try {
-        const btn = await this.driver.findElement(By.css(selector));
-        const displayed = await btn.isDisplayed().catch(() => false);
-        if (displayed) {
-          await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', btn);
-          await this.sleep(500);
-          await btn.click();
-          await this.waitForPageLoad();
-          await this.waitForLoaderToDisappear();
-          console.log(`[Upload] Continue clicked (${selector}).`);
-          return;
+    // Step 1: Find the upload card/drop zone for this document type
+    const dropZoneIndex = await this.driver.executeScript<number>(`
+      var docType = arguments[0];
+      var fileInputs = document.querySelectorAll('input[type="file"][data-document-type]');
+      var targetIdx = -1;
+      var target = docType.toLowerCase();
+
+      // Exact match first
+      for (var i = 0; i < fileInputs.length; i++) {
+        var dt = (fileInputs[i].getAttribute('data-document-type') || '').toLowerCase();
+        if (dt === target) { targetIdx = i; break; }
+      }
+
+      // Fuzzy match
+      if (targetIdx < 0) {
+        for (var i = 0; i < fileInputs.length; i++) {
+          var dt = (fileInputs[i].getAttribute('data-document-type') || '').toLowerCase();
+          if (dt.indexOf(target) >= 0 || target.indexOf(dt) >= 0) { targetIdx = i; break; }
         }
-      } catch {}
+      }
+
+      // Keyword match
+      if (targetIdx < 0) {
+        var keywords = target.split(/[\\s\\/\\-]+/);
+        for (var i = 0; i < fileInputs.length; i++) {
+          var dt = (fileInputs[i].getAttribute('data-document-type') || '').toLowerCase();
+          var matched = keywords.filter(function(kw) { return kw.length > 3 && dt.indexOf(kw) >= 0; });
+          if (matched.length >= 2) { targetIdx = i; break; }
+        }
+      }
+
+      if (targetIdx < 0) return -1;
+
+      // Scroll the upload card into view
+      var el = fileInputs[targetIdx];
+      var card = el.closest('[class*="uploaderCont"], [class*="upload-btn-wrapper"], [class*="CardSimple"], .ThemeGrid_Width12')
+        || el.parentElement;
+      if (card) card.scrollIntoView({ block: 'center' });
+
+      return targetIdx;
+    `, docType);
+
+    if (dropZoneIndex < 0) {
+      console.warn(`[Upload] No upload slot found for "${docType}"`);
+      return;
     }
+    await this.sleep(500);
 
-    // Try finding by text content
-    try {
-      const continueBtn = await this.driver.executeScript<WebElement | null>(`
-        var allBtns = document.querySelectorAll('input[type="submit"], input[type="button"], button, a.btn, a.button, a[class*="btn"]');
-        for (var i = 0; i < allBtns.length; i++) {
-          var text = (allBtns[i].textContent || allBtns[i].value || '').trim().toLowerCase();
-          if (text === 'continue' || text === 'next' || text === 'submit') {
-            return allBtns[i];
-          }
-        }
-        return null;
-      `);
-      if (continueBtn) {
-        await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', continueBtn);
-        await this.sleep(500);
-        await (continueBtn as WebElement).click();
-        await this.waitForPageLoad();
-        await this.waitForLoaderToDisappear();
-        console.log('[Upload] Continue clicked (text match).');
+    // Step 2: Inject a hidden file input, send the file, then simulate drop
+    // This is the JS_DROP_FILES approach from the StackOverflow/GitHub gist
+    await this.driver.executeScript(`
+      var idx = arguments[0];
+      var fileInputs = document.querySelectorAll('input[type="file"][data-document-type]');
+      var originalInput = fileInputs[idx];
+
+      // Find the drop zone — the clickable upload area near this file input
+      var dropZone = originalInput.closest('[class*="uploaderCont"], [class*="upload-btn-wrapper"], [class*="CardSimple"]')
+        || originalInput.parentElement;
+
+      // Create a temporary hidden file input for Selenium sendKeys
+      var tempInput = document.createElement('input');
+      tempInput.type = 'file';
+      tempInput.id = '__selenium_drop_input_' + idx;
+      tempInput.style.position = 'fixed';
+      tempInput.style.left = '0';
+      tempInput.style.top = '0';
+      tempInput.style.opacity = '0.001';
+      tempInput.style.width = '100px';
+      tempInput.style.height = '40px';
+      tempInput.style.zIndex = '999999';
+      tempInput.style.display = 'block';
+      document.body.appendChild(tempInput);
+
+      // Store the drop zone element index for later retrieval
+      window.__dropZoneIdx = idx;
+    `, dropZoneIndex);
+    await this.sleep(300);
+
+    // Step 3: Send the file path to the temp hidden input using Selenium
+    const tempInput = await this.driver.findElement(
+      By.css(`#__selenium_drop_input_${dropZoneIndex}`)
+    );
+    await tempInput.sendKeys(filePath);
+    console.log(`[Upload] sendKeys done for "${docType}"`);
+    await this.sleep(500);
+
+    // Step 4: Simulate drag-and-drop events from the temp input to the drop zone
+    // AND also directly set the original file input + trigger its handlers
+    await this.driver.executeScript(`
+      var idx = arguments[0];
+      var tempInput = document.getElementById('__selenium_drop_input_' + idx);
+      if (!tempInput || !tempInput.files || tempInput.files.length === 0) {
+        console.warn('[Upload JS] No file in temp input');
         return;
       }
-    } catch {}
 
-    console.log('[Upload] No Continue button found — page may have auto-advanced.');
-    // Save debug screenshot
-    try {
-      const screenshot = await this.driver.takeScreenshot();
-      const ssPath = path.resolve('test-results', 'continue-btn-debug.png');
-      fs.mkdirSync(path.dirname(ssPath), { recursive: true });
-      fs.writeFileSync(ssPath, screenshot, 'base64');
-      console.log(`[Upload] Continue button debug screenshot: ${ssPath}`);
-    } catch {}
+      var file = tempInput.files[0];
+      var fileInputs = document.querySelectorAll('input[type="file"][data-document-type]');
+      var originalInput = fileInputs[idx];
+
+      // Find the drop zone
+      var dropZone = originalInput.closest('[class*="uploaderCont"], [class*="upload-btn-wrapper"], [class*="CardSimple"]')
+        || originalInput.parentElement;
+
+      // ── Approach A: Drag-and-drop simulation ──
+      // Create a DataTransfer with the file
+      try {
+        var dt = new DataTransfer();
+        dt.items.add(file);
+
+        // Fire drag events on the drop zone
+        var dragenterEvt = new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt });
+        var dragoverEvt  = new DragEvent('dragover',  { bubbles: true, cancelable: true, dataTransfer: dt });
+        var dropEvt      = new DragEvent('drop',      { bubbles: true, cancelable: true, dataTransfer: dt });
+
+        dropZone.dispatchEvent(dragenterEvt);
+        dropZone.dispatchEvent(dragoverEvt);
+        dropZone.dispatchEvent(dropEvt);
+      } catch(e) {
+        console.warn('[Upload JS] Drag simulation error:', e);
+      }
+
+      // ── Approach B: Directly set the original file input's files ──
+      try {
+        var dt2 = new DataTransfer();
+        dt2.items.add(file);
+
+        // Remove ReadOnly / hidden from original input
+        originalInput.classList.remove('ReadOnly');
+        originalInput.removeAttribute('disabled');
+        originalInput.removeAttribute('readonly');
+        var p = originalInput.parentElement;
+        for (var i = 0; i < 5 && p; i++) {
+          p.classList.remove('ReadOnly');
+          p = p.parentElement;
+        }
+
+        // Set the files property using DataTransfer
+        originalInput.files = dt2.files;
+
+        // Fire change event
+        originalInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+        // Call the site's readUrldoc_XXX handler if it exists
+        var docClass = (originalInput.className || '').match(/doc_(\\d+)/);
+        if (docClass) {
+          var fnName = 'readUrldoc_' + docClass[1];
+          if (typeof window[fnName] === 'function') {
+            try { window[fnName](originalInput); } catch(e) {}
+          }
+        }
+
+        // Also trigger the inline onchange handler
+        if (originalInput.onchange) {
+          try { originalInput.onchange(new Event('change')); } catch(e) {}
+        }
+      } catch(e) {
+        console.warn('[Upload JS] Direct file set error:', e);
+      }
+
+      // Clean up temp input
+      if (tempInput.parentNode) tempInput.parentNode.removeChild(tempInput);
+    `, dropZoneIndex);
+
+    // Step 5: Wait for preview/upload confirmation (up to 30 seconds)
+    console.log(`[Upload] Waiting for "${docType}" preview...`);
+    await this.sleep(3000);
+
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const hasPreview = await this.driver.executeScript<boolean>(`
+        var idx = arguments[0];
+        var fileInputs = document.querySelectorAll('input[type="file"][data-document-type]');
+        var el = fileInputs[idx];
+        if (!el) return false;
+
+        // Find the card row containing this upload
+        var card = el.closest('.ThemeGrid_Width12, [class*="Row"], [class*="uploaderCont"], [class*="CardSimple"]')
+          || el.parentElement.parentElement.parentElement.parentElement;
+        if (!card) return false;
+
+        // Check for preview image
+        var imgs = card.querySelectorAll('img');
+        for (var i = 0; i < imgs.length; i++) {
+          var src = imgs[i].getAttribute('src') || '';
+          if (src && (src.startsWith('data:') || src.startsWith('blob:') || (src.startsWith('http') && !src.includes('placeholder')))) {
+            if (window.getComputedStyle(imgs[i]).display !== 'none') return true;
+          }
+        }
+
+        // Check for Delete/Download button (another upload-complete indicator)
+        var links = card.querySelectorAll('a, button, span');
+        for (var i = 0; i < links.length; i++) {
+          var t = (links[i].textContent || '').trim().toLowerCase();
+          if (t === 'delete' || t === 'download' || t.indexOf('delete') >= 0) return true;
+        }
+        return false;
+      `, dropZoneIndex);
+
+      if (hasPreview) {
+        console.log(`[Upload] "${docType}" — preview confirmed!`);
+        break;
+      }
+      if (attempt < 9) {
+        console.log(`[Upload] "${docType}" — waiting for preview (${attempt + 1}/10)...`);
+        await this.sleep(3000);
+      } else {
+        console.warn(`[Upload] "${docType}" — no preview after 30s. Trying direct click fallback...`);
+        // Fallback: physically click the upload area and use the native file dialog approach
+        await this.uploadViaDirectInput(dropZoneIndex, filePath);
+      }
+    }
+
+    await this.sleep(1000);
   }
 
   /**
-   * Uploads a single file to a file input element.
-   * Makes the input visible, sends the file path, dispatches change event,
-   * and waits for upload to complete.
+   * Fallback upload: makes the original file input visible and uses sendKeys directly.
    */
-  private async uploadFileToInput(input: WebElement, filePath: string, label: string): Promise<boolean> {
-    try {
-      // 1. Make the file input visible and interactable via JS
-      await this.driver.executeScript(`
-        var el = arguments[0];
-        el.style.display = 'block';
-        el.style.visibility = 'visible';
-        el.style.opacity = '1';
-        el.style.position = 'absolute';
-        el.style.width = '200px';
-        el.style.height = '40px';
-        el.style.zIndex = '99999';
-        el.style.left = '0px';
-        el.style.top = '0px';
-        el.removeAttribute('disabled');
-        el.removeAttribute('readonly');
-        // Also unhide any parent that may be hiding it
-        var parent = el.parentElement;
-        for (var i = 0; i < 5 && parent; i++) {
-          if (window.getComputedStyle(parent).display === 'none' ||
-              window.getComputedStyle(parent).visibility === 'hidden' ||
-              window.getComputedStyle(parent).overflow === 'hidden') {
-            parent.style.display = 'block';
-            parent.style.visibility = 'visible';
-            parent.style.overflow = 'visible';
-            parent.style.height = 'auto';
-            parent.style.width = 'auto';
-          }
-          parent = parent.parentElement;
-        }
-      `, input);
-      await this.sleep(500);
+  private async uploadViaDirectInput(dropZoneIndex: number, filePath: string): Promise<void> {
+    console.log(`[Upload] Trying direct input fallback for slot ${dropZoneIndex}...`);
 
-      // 2. Scroll into view
-      await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', input);
-      await this.sleep(300);
+    await this.driver.executeScript(`
+      var idx = arguments[0];
+      var fileInputs = document.querySelectorAll('input[type="file"][data-document-type]');
+      var el = fileInputs[idx];
+      if (!el) return;
 
-      // 3. Send the file path
-      await input.sendKeys(filePath);
-      console.log(`[Upload] sendKeys done for "${label}": ${path.basename(filePath)}`);
+      el.classList.remove('ReadOnly');
+      el.removeAttribute('disabled');
+      el.removeAttribute('readonly');
+      el.style.display = 'block';
+      el.style.visibility = 'visible';
+      el.style.opacity = '1';
+      el.style.width = '200px';
+      el.style.height = '40px';
+      el.style.position = 'relative';
 
-      // 4. Dispatch change and input events to trigger the framework's upload handler
-      await this.driver.executeScript(`
-        var el = arguments[0];
-        var changeEvent = new Event('change', { bubbles: true });
-        el.dispatchEvent(changeEvent);
-        var inputEvent = new Event('input', { bubbles: true });
-        el.dispatchEvent(inputEvent);
-      `, input);
-
-      // 5. Wait for upload to process — check for progress indicators
-      console.log(`[Upload] Waiting for "${label}" to upload...`);
-      await this.sleep(3000);
-
-      // Wait up to 30 seconds for upload completion
-      for (let attempt = 0; attempt < 10; attempt++) {
-        const uploadState = await this.driver.executeScript<{
-          hasProgress: boolean;
-          hasSpinner: boolean;
-          hasFileName: boolean;
-          fileNameText: string;
-        }>(`
-          var result = { hasProgress: false, hasSpinner: false, hasFileName: false, fileNameText: '' };
-          // Check for progress bars / spinners
-          var spinners = document.querySelectorAll('.loading, .spinner, .progress, [class*="loading"], [class*="progress"], [class*="uploading"]');
-          result.hasSpinner = spinners.length > 0;
-          for (var i = 0; i < spinners.length; i++) {
-            if (window.getComputedStyle(spinners[i]).display !== 'none') {
-              result.hasProgress = true;
-              break;
-            }
-          }
-          // Check if file name appears near the input (upload complete indicator)
-          var el = arguments[0];
-          var container = el.closest('.upload-container, .file-upload, [class*="upload"], [class*="attach"], div') || el.parentElement;
-          if (container) {
-            var text = container.textContent || '';
-            var basename = arguments[1];
-            if (text.indexOf(basename) >= 0 || text.indexOf('.jpg') >= 0 || text.indexOf('.pdf') >= 0 || text.indexOf('.png') >= 0) {
-              result.hasFileName = true;
-              result.fileNameText = text.substring(0, 150).trim();
-            }
-          }
-          return result;
-        `, input, path.basename(filePath));
-
-        if (uploadState.hasFileName) {
-          console.log(`[Upload] "${label}" upload confirmed — file name visible.`);
-          break;
-        }
-        if (uploadState.hasProgress) {
-          console.log(`[Upload] "${label}" still uploading... (attempt ${attempt + 1})`);
-          await this.sleep(3000);
-        } else {
-          // No progress indicator and no file name — upload may have completed quickly
-          // or the site uses a different indicator. Wait a bit more and move on.
-          await this.sleep(2000);
-          break;
-        }
+      var p = el.parentElement;
+      for (var i = 0; i < 5 && p; i++) {
+        p.classList.remove('ReadOnly');
+        var cs = window.getComputedStyle(p);
+        if (cs.display === 'none') p.style.display = 'block';
+        if (cs.visibility === 'hidden') p.style.visibility = 'visible';
+        p = p.parentElement;
       }
+    `, dropZoneIndex);
+    await this.sleep(300);
 
-      await this.waitForPageLoad();
-      await this.sleep(2000);
-      return true;
-    } catch (err) {
-      console.error(`[Upload] Error uploading "${label}":`, err);
-      return false;
+    // Find the actual file input and sendKeys
+    const fileInputs = await this.driver.findElements(By.css('input[type="file"][data-document-type]'));
+    if (dropZoneIndex < fileInputs.length) {
+      await fileInputs[dropZoneIndex].sendKeys(filePath);
+
+      // Trigger handlers
+      await this.driver.executeScript(`
+        var idx = arguments[0];
+        var fileInputs = document.querySelectorAll('input[type="file"][data-document-type]');
+        var el = fileInputs[idx];
+        if (!el) return;
+
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+
+        var docClass = (el.className || '').match(/doc_(\\d+)/);
+        if (docClass) {
+          var fnName = 'readUrldoc_' + docClass[1];
+          if (typeof window[fnName] === 'function') {
+            try { window[fnName](el); } catch(e) {}
+          }
+        }
+        if (el.onchange) {
+          try { el.onchange(new Event('change')); } catch(e) {}
+        }
+      `, dropZoneIndex);
+      console.log(`[Upload] Direct input fallback sendKeys done for slot ${dropZoneIndex}.`);
     }
   }
 
   /**
-   * Uploads documents using file inputs found in the current browsing context.
-   * Matches slots to file inputs by: data-document-type, nearby label text, or input order.
+   * Clicks Continue on the upload page. Retries for up to 60 seconds
+   * since the button only appears after all mandatory uploads complete.
    */
-  private async uploadInCurrentContext(
-    slots: Array<{ label: string; keywords: string[]; file: string }>
-  ): Promise<void> {
-    const fileInputs = await this.driver.findElements(By.css('input[type="file"]'));
-    console.log(`[Upload] ${fileInputs.length} file input(s) in current context.`);
+  private async clickUploadContinue(): Promise<void> {
+    for (let retry = 0; retry < 20; retry++) {
+      // Try CSS selectors
+      for (const sel of [
+        'input[value="Continue"]', 'a[id*="Continue"]', 'button[id*="Continue"]',
+        'input[id*="Continue"]', '[data-staticid*="Continue"]',
+      ]) {
+        try {
+          const btn = await this.driver.findElement(By.css(sel));
+          if (await btn.isDisplayed().catch(() => false)) {
+            await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', btn);
+            await this.sleep(500);
+            await btn.click();
+            await this.waitForPageLoad();
+            console.log(`[Upload] Continue clicked.`);
+            return;
+          }
+        } catch {}
+      }
 
-    // Try matching by data-document-type attribute first
-    const hasDataAttr = await this.driver.executeScript<boolean>(`
-      return document.querySelectorAll('input[type="file"][data-document-type]').length > 0;
-    `);
-
-    if (hasDataAttr) {
-      // Use data-document-type matching
-      for (const slot of slots) {
-        if (!slot.file) continue;
-        const filePath = path.resolve(slot.file);
-        if (!fs.existsSync(filePath)) { console.warn(`[Upload] File missing: ${filePath}`); continue; }
-        const input = await this.findFileInputByAttr(slot.label);
-        if (input) {
-          await this.uploadFileToInput(input, filePath, slot.label);
-        } else {
-          // Try partial / fuzzy matching on data-document-type
-          const fuzzyInput = await this.findFileInputByFuzzyAttr(slot.label, slot.keywords);
-          if (fuzzyInput) {
-            await this.uploadFileToInput(fuzzyInput, filePath, slot.label);
-          } else {
-            console.warn(`[Upload] No slot for: "${slot.label}"`);
+      // Try text content match
+      const found = await this.driver.executeScript<boolean>(`
+        var btns = document.querySelectorAll('input[type="submit"], input[type="button"], button, a');
+        for (var i = 0; i < btns.length; i++) {
+          var t = (btns[i].textContent || btns[i].value || '').trim().toLowerCase();
+          if ((t === 'continue' || t === 'next' || t === 'submit')
+              && window.getComputedStyle(btns[i]).display !== 'none') {
+            btns[i].scrollIntoView({ block: 'center' });
+            btns[i].click();
+            return true;
           }
         }
-      }
-    } else {
-      // Match by nearby label/text or sequential order
-      const inputContexts = await this.driver.executeScript<string[]>(`
-        return Array.from(document.querySelectorAll('input[type="file"]')).map(function(el) {
-          var container = el.closest('div, td, tr, li, section') || el.parentElement;
-          var text = container ? container.textContent.trim().substring(0, 200) : '';
-          return text;
-        });
+        return false;
       `);
-
-      console.log('[Upload] File input contexts:');
-      for (let i = 0; i < inputContexts.length; i++) {
-        console.log(`  [${i}] ${inputContexts[i].substring(0, 100)}`);
+      if (found) {
+        await this.waitForPageLoad();
+        console.log('[Upload] Continue clicked.');
+        return;
       }
 
-      // Match each slot to an input by keyword matching
-      const usedIndices = new Set<number>();
-      for (const slot of slots) {
-        if (!slot.file) continue;
-        const filePath = path.resolve(slot.file);
-        if (!fs.existsSync(filePath)) { console.warn(`[Upload] File missing: ${filePath}`); continue; }
-
-        let bestIdx = -1;
-        for (let i = 0; i < inputContexts.length; i++) {
-          if (usedIndices.has(i)) continue;
-          const ctx = inputContexts[i].toLowerCase();
-          if (slot.keywords.some(kw => ctx.includes(kw.toLowerCase()))) {
-            bestIdx = i;
-            break;
-          }
-        }
-
-        if (bestIdx >= 0) {
-          usedIndices.add(bestIdx);
-          const input = fileInputs[bestIdx];
-          await this.uploadFileToInput(input, filePath, slot.label);
-        } else {
-          console.warn(`[Upload] No matching input for: "${slot.label}"`);
-        }
-      }
+      console.log(`[Upload] Continue not visible yet (${retry + 1}/20)...`);
+      await this.sleep(3000);
     }
-  }
 
-  private async findFileInputByAttr(label: string): Promise<WebElement | null> {
-    try {
-      return await this.driver.findElement(By.css(`input[type="file"][data-document-type="${label}"]`));
-    } catch {
-      const matchIdx = await this.driver.executeScript<number>(`
-        var inputs = Array.from(document.querySelectorAll('input[type="file"][data-document-type]'));
-        var target = arguments[0].toLowerCase();
-        return inputs.findIndex(function(el) { return (el.getAttribute('data-document-type') || '').toLowerCase() === target; });
-      `, label);
-      if (matchIdx < 0) return null;
-      const inputs = await this.driver.findElements(By.css('input[type="file"][data-document-type]'));
-      return inputs[matchIdx] || null;
-    }
-  }
-
-  /**
-   * Fuzzy match: finds a file input whose data-document-type contains any of the keywords.
-   */
-  private async findFileInputByFuzzyAttr(label: string, keywords: string[]): Promise<WebElement | null> {
-    const matchIdx = await this.driver.executeScript<number>(`
-      var inputs = Array.from(document.querySelectorAll('input[type="file"][data-document-type]'));
-      var keywords = arguments[0];
-      for (var k = 0; k < keywords.length; k++) {
-        var kw = keywords[k].toLowerCase();
-        for (var i = 0; i < inputs.length; i++) {
-          var dtype = (inputs[i].getAttribute('data-document-type') || '').toLowerCase();
-          if (dtype.indexOf(kw) >= 0) return i;
-        }
-      }
-      return -1;
-    `, keywords);
-    if (matchIdx < 0) return null;
-    const inputs = await this.driver.findElements(By.css('input[type="file"][data-document-type]'));
-    return inputs[matchIdx] || null;
+    console.warn('[Upload] Continue button not found after 60s.');
   }
 
   // ── Navigation ─────────────────────────────────────────────────────────────
@@ -735,133 +754,123 @@ export class GdrfaPortalPage {
     await this.waitForPageLoad();
   }
 
+  // ── Physical Select2 click helper ──────────────────────────────────────────
+
+  /**
+   * Physically clicks a Select2 dropdown open and selects an option.
+   * Works by finding the label text on the page, locating the nearest Select2,
+   * clicking it with Selenium, and clicking the matching option.
+   *
+   * @param labelText - Text near the dropdown (e.g. "Visit Reason", "Passport Type")
+   * @param optionText - Option to select (e.g. "Tourism", "Normal")
+   * @returns true if successfully selected
+   */
+  private async clickSelect2ByLabel(labelText: string, optionText: string): Promise<boolean> {
+    // Find all Select2 containers and match by nearby label text
+    const s2Index = await this.driver.executeScript<number>(`
+      var label = arguments[0];
+      var s2s = document.querySelectorAll('.select2-container');
+      for (var i = 0; i < s2s.length; i++) {
+        var s2 = s2s[i];
+        // Check the text content of parent containers for the label
+        var parent = s2.parentElement;
+        for (var depth = 0; depth < 8 && parent; depth++) {
+          var siblings = parent.children;
+          for (var j = 0; j < siblings.length; j++) {
+            var sib = siblings[j];
+            if (sib === s2 || sib.querySelector('.select2-container')) continue;
+            var text = (sib.textContent || '').trim();
+            if (text.length < 50 && text.replace(/[\\s*]/g, '').toLowerCase().indexOf(label.replace(/[\\s*]/g, '').toLowerCase()) >= 0) {
+              // Remove ReadOnly
+              s2.classList.remove('ReadOnly');
+              s2.querySelectorAll('.ReadOnly').forEach(function(el) { el.classList.remove('ReadOnly'); });
+              var p = s2.parentElement;
+              for (var k = 0; k < 5 && p; k++) { p.classList.remove('ReadOnly'); p = p.parentElement; }
+              return i;
+            }
+          }
+          parent = parent.parentElement;
+        }
+      }
+      return -1;
+    `, labelText);
+
+    if (s2Index < 0) {
+      console.warn(`[Select2] No dropdown found near "${labelText}".`);
+      return false;
+    }
+
+    // Get the container with Selenium and check if already set
+    const s2Containers = await this.driver.findElements(By.css('.select2-container'));
+    if (s2Index >= s2Containers.length) return false;
+    const container = s2Containers[s2Index];
+
+    try {
+      const chosenSpan = await container.findElement(By.css('.select2-chosen'));
+      const currentText = await chosenSpan.getText();
+      if (currentText.toUpperCase().includes(optionText.toUpperCase())) {
+        console.log(`[Skip] "${labelText}" already set: "${currentText.trim()}".`);
+        return true;
+      }
+    } catch {}
+
+    // Scroll and click the dropdown open
+    await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', container);
+    await this.sleep(500);
+
+    try {
+      const choiceLink = await container.findElement(By.css('.select2-choice, a'));
+      await choiceLink.click();
+    } catch {
+      await container.click();
+    }
+    await this.sleep(2000);
+
+    // Find and click the option
+    const results = await this.driver.findElements(
+      By.css('.select2-drop-active .select2-results li')
+    );
+    console.log(`[Select2] "${labelText}" dropdown: ${results.length} options.`);
+
+    for (const li of results) {
+      const text = await li.getText().catch(() => '');
+      if (text.toUpperCase().includes(optionText.toUpperCase())) {
+        await li.click();
+        console.log(`[Select2] "${labelText}" → "${text.trim()}".`);
+        await this.waitForPageLoad();
+        await this.sleep(1500);
+        return true;
+      }
+    }
+
+    // Log options if not found
+    for (let i = 0; i < Math.min(results.length, 10); i++) {
+      const t = await results[i].getText().catch(() => '');
+      console.log(`  option[${i}]: "${t.trim()}"`);
+    }
+
+    // Close dropdown
+    await this.driver.executeScript(`
+      var drop = document.querySelector('.select2-drop-active');
+      if (drop) { drop.style.display = 'none'; drop.classList.remove('select2-drop-active'); }
+    `);
+
+    console.warn(`[Select2] "${optionText}" not found in "${labelText}" dropdown.`);
+    return false;
+  }
+
   // ── Passport header (Passport Type → Nationality → Search Data) ────────────
 
   private async setVisitReason(): Promise<void> {
     console.log('[Form] Selecting Visit Reason → Tourism...');
-    const set = await this.driver.executeScript<boolean>(`
-      // Try multiple selectors for Visit Reason
-      var sel = document.querySelector('select[data-staticid="cmbVisitReason"]')
-        || document.querySelector('select[id*="VisitReason"]')
-        || document.querySelector('select[id*="visitReason"]')
-        || document.querySelector('select[name*="VisitReason"]');
-
-      // Fallback: find by label text
-      if (!sel) {
-        var labels = Array.from(document.querySelectorAll('label'));
-        var lbl = labels.find(function(l) {
-          var t = (l.textContent || '').trim().toLowerCase();
-          return t.indexOf('visit') >= 0 && t.indexOf('reason') >= 0;
-        });
-        if (lbl && lbl.htmlFor) {
-          var el = document.getElementById(lbl.htmlFor);
-          sel = (el instanceof HTMLSelectElement) ? el
-            : (el && el.parentElement ? el.parentElement.querySelector('select') : null);
-        }
-      }
-
-      // Last fallback: find the first select in "Visit Details" section
-      if (!sel) {
-        var sections = document.querySelectorAll('a[href*="Visit"], span, div, td');
-        for (var i = 0; i < sections.length; i++) {
-          if ((sections[i].textContent || '').trim() === 'Visit Details') {
-            var container = sections[i].closest('div, section, table');
-            if (container) {
-              var selects = container.querySelectorAll('select');
-              if (selects.length > 0) { sel = selects[0]; break; }
-            }
-          }
-        }
-      }
-
-      if (!sel) {
-        // Debug: log all selects on page
-        var allSelects = document.querySelectorAll('select');
-        console.log('All selects on page: ' + allSelects.length);
-        allSelects.forEach(function(s, i) {
-          var opts = Array.from(s.options).map(function(o) { return o.text.trim(); }).slice(0, 5).join(', ');
-          console.log('  select[' + i + '] id=' + s.id + ' opts: ' + opts);
-        });
-        return false;
-      }
-
-      var currentText = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].text.trim() : '';
-      if (currentText.toUpperCase().indexOf('TOURISM') >= 0) return true;
-
-      // Find the Tourism option
-      var tourismOpt = Array.from(sel.options).find(function(o) {
-        return o.text.trim().toUpperCase().indexOf('TOURISM') >= 0;
-      });
-      if (tourismOpt) {
-        sel.value = tourismOpt.value;
-      } else {
-        // Try value '1' as fallback
-        sel.value = '1';
-      }
-      sel.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
-    `);
-    if (set) {
-      await this.waitForPageLoad();
-      await this.sleep(1000);
-      console.log('[Form] Visit Reason → Tourism.');
-    } else {
-      console.warn('[Form] Visit Reason select not found.');
-    }
+    const ok = await this.clickSelect2ByLabel('Visit Reason', 'Tourism');
+    if (!ok) console.warn('[Form] Visit Reason: FAILED.');
   }
 
   private async setPassportType(passportType: string): Promise<void> {
-    console.log(`[Form] Setting Passport Type: "${passportType}"...`);
-    const set = await this.driver.executeScript<boolean>(`
-      var type = arguments[0];
-
-      // Try specific selectors first
-      var sel = document.querySelector('select[data-staticid*="PassportType"]')
-        || document.querySelector('select[id*="PassportType"]')
-        || document.querySelector('select[id*="passportType"]')
-        || document.querySelector('select[name*="PassportType"]');
-
-      // Fallback: find by label "Passport Type"
-      if (!sel) {
-        var labels = Array.from(document.querySelectorAll('label'));
-        var lbl = labels.find(function(l) {
-          var t = (l.textContent || '').replace(/\\*/, '').trim().toLowerCase();
-          return t === 'passport type';
-        });
-        if (lbl && lbl.htmlFor) {
-          var el = document.getElementById(lbl.htmlFor);
-          sel = (el instanceof HTMLSelectElement) ? el
-            : (el && el.parentElement ? el.parentElement.querySelector('select') : null);
-        }
-      }
-
-      // Last fallback: find any select that has "Normal" as an option
-      if (!sel) {
-        var allSels = Array.from(document.querySelectorAll('select'));
-        sel = allSels.find(function(s) {
-          return Array.from(s.options).some(function(o) {
-            return o.text.trim().toLowerCase() === 'normal';
-          });
-        }) || null;
-      }
-
-      if (!sel) return false;
-
-      var match = Array.from(sel.options).find(function(o) {
-        return o.text.trim().toLowerCase() === type.toLowerCase();
-      });
-      if (!match) return false;
-      sel.value = match.value;
-      sel.dispatchEvent(new Event('change', { bubbles: true }));
-      return true;
-    `, passportType);
-    if (set) {
-      await this.waitForPageLoad();
-      await this.sleep(500);
-      console.log('[Form] Passport Type set: ' + passportType);
-    } else {
-      console.warn('[Form] Passport Type select not found.');
-    }
+    console.log(`[Form] Setting Passport Type → "${passportType}"...`);
+    const ok = await this.clickSelect2ByLabel('Passport Type', passportType);
+    if (!ok) console.warn(`[Form] Passport Type: FAILED.`);
   }
 
   private async enterPassportNumber(passportNumber: string): Promise<void> {
@@ -1223,52 +1232,58 @@ export class GdrfaPortalPage {
       }
     }
 
-    // Profession
+    // Profession — hardcoded to SALES EXECUTIVE
     {
-      const currentProf = await this.driver.executeScript<string>(`
-        var hidden = document.querySelector('input[id*="wtProfession"][type="hidden"]');
-        return hidden ? (hidden.value || '').trim() : '';
-      `);
-      if (currentProf) {
-        console.log(`[Skip] Profession already set (value: "${currentProf}").`);
-      } else {
-        console.log('[Form] Filling Profession: typing "SALES" → selecting "SALES EXECUTIVE"...');
-        try {
-          const profInput = await this.driver.findElement(By.css('input[id*="wtProfessionSerch"]'));
-          if (await profInput.isDisplayed().catch(() => false)) {
-            await profInput.click();
-            await profInput.clear();
-
-            // Type character by character
-            for (const char of 'SALES') {
-              await profInput.sendKeys(char);
-              await this.sleep(40);
-            }
-
-            // Wait for autocomplete dropdown
-            await this.sleep(1000);
-            const matched = await this.driver.executeScript<boolean>(`
-              var items = document.querySelectorAll('ul.os-internal-ui-autocomplete li.os-internal-ui-menu-item');
-              for (var i = 0; i < items.length; i++) {
-                if (items[i].textContent.trim().toUpperCase() === 'SALES EXECUTIVE') {
-                  items[i].click();
-                  return true;
-                }
-              }
-              if (items.length > 0) { items[0].click(); return true; }
-              return false;
-            `);
-            if (matched) {
-              console.log('[Form] Profession selected.');
-            } else {
-              console.warn('[Form] Profession autocomplete suggestions not found.');
-            }
-          } else {
-            console.warn('[Form] Profession input not found.');
-          }
-        } catch {
-          console.warn('[Form] Profession input not found.');
+      console.log('[Form] Setting Profession → SALES EXECUTIVE...');
+      const profSet = await this.driver.executeScript<boolean>(`
+        // Check if already set
+        var hidden = document.querySelector('input[id*="wtProfession"][type="hidden"], input[id*="Profession"][type="hidden"]');
+        if (hidden && hidden.value && hidden.value.trim() !== '') {
+          return true; // already set
         }
+
+        // Find the search input for profession (various ID patterns)
+        var searchInput = document.querySelector('input[id*="wtProfessionSerch"]')
+          || document.querySelector('input[id*="ProfessionSerch"]')
+          || document.querySelector('input[id*="Profession"][type="text"]')
+          || document.querySelector('input[id*="profession"][type="text"]');
+
+        // Also find the hidden input that stores the actual value
+        if (!hidden) {
+          hidden = document.querySelector('input[id*="Profession"][type="hidden"]')
+            || document.querySelector('input[id*="profession"][type="hidden"]');
+        }
+
+        // Strategy 1: Set the hidden value directly
+        if (hidden) {
+          hidden.value = 'SALES EXECUTIVE';
+          hidden.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        // Strategy 2: Set the visible search input text
+        if (searchInput) {
+          // Remove ReadOnly
+          searchInput.classList.remove('ReadOnly');
+          var p = searchInput.parentElement;
+          for (var i = 0; i < 5 && p; i++) { p.classList.remove('ReadOnly'); p = p.parentElement; }
+          searchInput.removeAttribute('disabled');
+          searchInput.removeAttribute('readonly');
+
+          // Set the value using native setter
+          var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+          setter.call(searchInput, 'SALES EXECUTIVE');
+          searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+          searchInput.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        return !!(hidden || searchInput);
+      `);
+
+      if (profSet) {
+        await this.sleep(800);
+        console.log('[Form] Profession → SALES EXECUTIVE.');
+      } else {
+        console.warn('[Form] Profession: no input found on page.');
       }
     }
 
