@@ -71,6 +71,10 @@ export class GdrfaPortalPage {
     console.log('[Upload] Starting document upload...');
     await this.page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
 
+    // Wait for upload zone JS to initialise (file inputs must be in the DOM)
+    await this.page.locator('input[type="file"][data-document-type]').first()
+      .waitFor({ state: 'attached', timeout: 15000 });
+
     // Map document type labels to file paths.
     // Labels must match the data-document-type attribute on each input[type="file"].
     const slots: Array<{ label: string; file: string }> = [
@@ -98,30 +102,7 @@ export class GdrfaPortalPage {
         continue;
       }
 
-      // Match by data-document-type attribute (exact match first, then case-insensitive)
-      let fileInput = this.page.locator(`input[type="file"][data-document-type="${slot.label}"]`);
-      if (await fileInput.count() === 0) {
-        // Fallback: case-insensitive search via evaluate
-        const matchIdx = await this.page.evaluate((label: string) => {
-          const inputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"][data-document-type]'));
-          const target = label.toLowerCase();
-          const idx = inputs.findIndex(el => (el.getAttribute('data-document-type') ?? '').toLowerCase() === target);
-          return idx;
-        }, slot.label);
-
-        if (matchIdx < 0) {
-          console.warn(`[Upload] Slot not found on page: "${slot.label}"`);
-          continue;
-        }
-        fileInput = this.page.locator('input[type="file"][data-document-type]').nth(matchIdx);
-      }
-
-      await fileInput.scrollIntoViewIfNeeded().catch(() => {});
-      await fileInput.setInputFiles(filePath);
-      console.log(`[Upload] "${slot.label}": ${path.basename(filePath)}`);
-
-      // Wait for the upload to process
-      await this.page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      await this.uploadSingleDocument(slot.label, filePath);
     }
 
     console.log('[Upload] All documents uploaded. Waiting for Continue button...');
@@ -143,6 +124,77 @@ export class GdrfaPortalPage {
     await this.page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
     await this.waitForLoaderToDisappear();
     console.log('[Upload] Continue clicked — done.');
+  }
+
+  private async findFileInput(label: string) {
+    let fileInput = this.page.locator(`input[type="file"][data-document-type="${label}"]`);
+    if (await fileInput.count() > 0) return fileInput;
+
+    // Fallback: case-insensitive search via evaluate
+    const matchIdx = await this.page.evaluate((lbl: string) => {
+      const inputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"][data-document-type]'));
+      const target = lbl.toLowerCase();
+      return inputs.findIndex(el => (el.getAttribute('data-document-type') ?? '').toLowerCase() === target);
+    }, label);
+
+    if (matchIdx < 0) return null;
+    return this.page.locator('input[type="file"][data-document-type]').nth(matchIdx);
+  }
+
+  private async isUploadSlotFilled(label: string): Promise<boolean> {
+    return this.page.evaluate((lbl: string) => {
+      const input = document.querySelector<HTMLInputElement>(
+        `input[type="file"][data-document-type="${lbl}"]`
+      ) ?? Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"][data-document-type]'))
+        .find(el => (el.getAttribute('data-document-type') ?? '').toLowerCase() === lbl.toLowerCase());
+      if (!input) return false;
+      // Walk up to the slot container and check if "Drag here" prompt is gone
+      const container = input.closest('[class*="upload"], [class*="dropzone"], [class*="Upload"]')
+        || input.parentElement?.parentElement?.parentElement;
+      if (!container) return false;
+      return !container.textContent?.includes('Drag here or click to upload');
+    }, label);
+  }
+
+  private async uploadSingleDocument(label: string, filePath: string): Promise<void> {
+    const fileInput = await this.findFileInput(label);
+    if (!fileInput) {
+      console.warn(`[Upload] Slot not found on page: "${label}"`);
+      return;
+    }
+
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await fileInput.scrollIntoViewIfNeeded().catch(() => {});
+      await fileInput.setInputFiles(filePath);
+
+      if (attempt > 1) {
+        // On retry, also dispatch change event and click Submit as fallback
+        await fileInput.dispatchEvent('change');
+        const submitBtn = fileInput.locator('xpath=ancestor::div[.//button]//button[contains(text(),"Submit")]');
+        if (await submitBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+          await submitBtn.click();
+        }
+      }
+
+      // Wait for the upload to process
+      await this.page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+
+      // Verify the upload took effect
+      const filled = await this.isUploadSlotFilled(label);
+      if (filled) {
+        console.log(`[Upload] "${label}": ${path.basename(filePath)}`);
+        return;
+      }
+
+      if (attempt < maxAttempts) {
+        console.log(`[Upload] "${label}" still empty — retrying (attempt ${attempt + 1}/${maxAttempts})...`);
+        await this.page.waitForTimeout(1000);
+      }
+    }
+
+    // Log even if verification failed — setInputFiles may have worked but DOM check is unreliable
+    console.warn(`[Upload] "${label}": ${path.basename(filePath)} (unverified — slot may still appear empty)`);
   }
 
   // ── Navigation ─────────────────────────────────────────────────────────────
