@@ -1,4 +1,4 @@
-import { Page } from '@playwright/test';
+import { WebDriver, By, until, WebElement, Key } from 'selenium-webdriver';
 import * as path from 'path';
 import * as fs from 'fs';
 import {
@@ -8,25 +8,29 @@ import {
   ContactDetails,
   ApplicationDocuments,
 } from '../types/application-data';
+
 // ─── Page Object ──────────────────────────────────────────────────────────────
 
 export class GdrfaPortalPage {
   private static readonly HOME = 'https://smart.gdrfad.gov.ae/SmartChannels_Th/';
+  private static readonly ACTION_TIMEOUT = 20_000;
 
-  constructor(private readonly page: Page) {}
+  constructor(private readonly driver: WebDriver) {}
 
   // ── Public API ─────────────────────────────────────────────────────────────
 
   async verifySession(): Promise<void> {
     console.log('[Session] Verifying session...');
-    await this.page.goto(GdrfaPortalPage.HOME, { waitUntil: 'networkidle' });
-    if (this.page.url().includes('Login.aspx')) {
+    await this.driver.get(GdrfaPortalPage.HOME);
+    await this.waitForPageLoad();
+    const url = await this.driver.getCurrentUrl();
+    if (url.includes('Login.aspx')) {
       throw new Error('[Session] Session expired — run "npm run auth" to log in again.');
     }
-    console.log('[Session] Valid. URL:', this.page.url());
+    console.log('[Session] Valid. URL:', url);
   }
 
-  async fillApplicationForm(application: VisaApplication): Promise<void> {
+  async fillApplicationForm(application: VisaApplication): Promise<string> {
     console.log('\n[Flow] ─── Starting navigation ───');
     const stopKeepAlive = this.startSessionKeepAlive();
     try {
@@ -34,167 +38,595 @@ export class GdrfaPortalPage {
       await this.navigateToNewApplication();
       await this.waitForPageSettle();
 
+      // ── Section 1: Visit Details ──
+      console.log('\n[Flow] ── Section: Visit Details ──');
       await this.setVisitReason();
+      await this.sleep(1000);
+
+      // ── Section 2: Passport Details ──
+      console.log('\n[Flow] ── Section: Passport Details ──');
       await this.setPassportType(application.passport.passportType);
+      await this.sleep(800);
       await this.enterPassportNumber(application.passport.passportNumber);
+      await this.sleep(800);
       await this.setNationality(application.passport.currentNationality);
+      await this.sleep(1000);
       await this.setPreviousNationality(
         application.passport.previousNationality ?? application.passport.currentNationality
       );
+      await this.sleep(1000);
       await this.clickSearchDataAndWait();
+      await this.sleep(2000);
 
+      // ── Section 3: Passport Names ──
+      console.log('\n[Flow] ── Section: Passport Names ──');
       await this.fillPassportNames(application.passport);
+      await this.sleep(1500);
+
+      // ── Section 4: Passport Dates & Details ──
+      console.log('\n[Flow] ── Section: Passport Dates ──');
       await this.fillPassportDetails(application.passport);
-      await this.fillApplicantDetails(application.applicant);
+      await this.sleep(1500);
+
+      // ── Section 5: Applicant Details ──
+      console.log('\n[Flow] ── Section: Applicant Details ──');
+      await this.fillApplicantDetails(application.applicant, application.passport.passportIssueCountry);
+      await this.sleep(1500);
+
+      // ── Section 6: Contact Details ──
+      console.log('\n[Flow] ── Section: Contact Details ──');
       await this.fillContactDetails(application.contact);
+      await this.sleep(1500);
 
       // Retry Faith selection before continuing (dropdown can reset after other fields)
-      if (application.applicant.faith) {
-        await this.retryFaithSelection(application.applicant.faith);
-      }
+      await this.retryFaithSelection('Unknown');
+      await this.sleep(1000);
 
       // Validate all required fields before clicking Continue — retry any empty ones
       await this.validateAndRetryRequiredFields(application);
+      await this.sleep(1000);
 
       await this.clickContinue();
 
       // Upload documents on the Attachments tab
+      console.log('\n[Flow] ── Section: Document Upload ──');
       await this.uploadDocuments(application.documents);
 
-      console.log('\n[Flow] ─── Steps complete. ───\n');
+      // Capture the Application Number from the page
+      const appNumber = await this.captureApplicationNumber();
+      console.log(`\n[Flow] ─── Application Number: ${appNumber || 'NOT FOUND'} ───\n`);
+      return appNumber;
     } finally {
       stopKeepAlive();
     }
   }
 
-  async uploadDocuments(docs: ApplicationDocuments): Promise<void> {
-    console.log('[Upload] Starting document upload...');
-    await this.page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+  /**
+   * Captures the Application Number from the page after form submission.
+   * Checks multiple locations: header area, confirmation page, URL params, and page text.
+   */
+  private async captureApplicationNumber(): Promise<string> {
+    console.log('[Capture] Looking for Application Number...');
+    await this.sleep(3000);
 
-    // Wait for upload zone JS to initialise (file inputs must be in the DOM)
-    await this.page.locator('input[type="file"][data-document-type]').first()
-      .waitFor({ state: 'attached', timeout: 15000 });
-
-    // Map document type labels to file paths.
-    // Labels must match the data-document-type attribute on each input[type="file"].
-    const slots: Array<{ label: string; file: string }> = [
-      { label: 'Hotel reservation/Place of stay - Page 1', file: docs.hotelReservationPage1 },
-      { label: 'Hotel reservation/Place of stay - Page 2', file: docs.hotelReservationPage2 ?? '' },
-      { label: 'Passport External Cover Page',             file: docs.passportExternalCoverPage },
-      { label: 'Personal Photo',                           file: docs.personalPhoto },
-      { label: 'Return air ticket - Page 1',               file: docs.returnAirTicketPage1 },
-      { label: 'Sponsored Passport page 1',                file: docs.sponsoredPassportPage1 },
-    ];
-
-    // Log all available document types on the page for debugging
-    const availableTypes = await this.page.evaluate(() =>
-      Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"][data-document-type]'))
-        .map(el => el.getAttribute('data-document-type') ?? '')
-    );
-    console.log(`[Upload] Available document types on page: ${JSON.stringify(availableTypes)}`);
-
-    for (const slot of slots) {
-      if (!slot.file) continue;
-
-      const filePath = path.resolve(slot.file);
-      if (!fs.existsSync(filePath)) {
-        console.warn(`[Upload] File not found, skipping "${slot.label}": ${filePath}`);
-        continue;
+    const rawAppNo = await this.driver.executeScript<string>(`
+      // 1. Check the header area (Application No. field at top of page)
+      var headerSpans = document.querySelectorAll('span, td, div');
+      for (var i = 0; i < headerSpans.length; i++) {
+        var text = (headerSpans[i].textContent || '').trim();
+        // Look for "Application No." label followed by a value
+        if (text.match(/Application\\s*No\\.?\\s*$/i)) {
+          var next = headerSpans[i].nextElementSibling;
+          if (next) {
+            var val = next.textContent.trim();
+            if (val && val !== 'None' && val !== '') return val;
+          }
+        }
+        // Look for combined "Application No. XXXX" text
+        var match = text.match(/Application\\s*(?:No\\.?|Number)\\s*[:\\s]*([A-Z0-9\\/-]+)/i);
+        if (match && match[1] && match[1] !== 'None') return match[1];
       }
 
-      await this.uploadSingleDocument(slot.label, filePath);
+      // 2. Check for Application Number in any bold/highlighted element
+      var bolds = document.querySelectorAll('b, strong, .Bold, span[class*="app"], span[class*="App"]');
+      for (var i = 0; i < bolds.length; i++) {
+        var t = (bolds[i].textContent || '').trim();
+        if (/^[A-Z0-9]{2,}[\\/\\-][A-Z0-9]+/i.test(t)) return t;
+      }
+
+      // 3. Check URL for application ID
+      var urlMatch = window.location.href.match(/[Aa]pplication[Ii]d=([^&]+)/);
+      if (urlMatch) return urlMatch[1];
+
+      // 4. Check for any element with "application" in its ID that has a value
+      var appEls = document.querySelectorAll('[id*="Application"], [id*="application"]');
+      for (var i = 0; i < appEls.length; i++) {
+        var val = (appEls[i].textContent || appEls[i].value || '').trim();
+        if (val && val !== 'None' && val.length > 3 && val.length < 50) return val;
+      }
+
+      // 5. Look for any long numeric string on the page (GDRFA app numbers are 14+ digits)
+      var allText = document.body.innerText || '';
+      var numMatch = allText.match(/(\\d{10,20})/);
+      if (numMatch) return numMatch[1];
+
+      return '';
+    `);
+
+    // Clean up the application number — extract just digits
+    let appNo = rawAppNo || '';
+    if (appNo) {
+      // Extract the numeric portion (GDRFA app numbers are purely numeric, 14+ digits)
+      const numericMatch = appNo.match(/(\d{10,20})/);
+      if (numericMatch) {
+        appNo = numericMatch[1];
+      } else {
+        // Remove common trailing garbage like "DraftUpload", "Draft", etc.
+        appNo = appNo.replace(/(Draft|Upload|DraftUpload|Page|View|Edit|New|Status).*$/gi, '').trim();
+      }
+      console.log(`[Capture] Application Number: ${appNo}`);
+    } else {
+      console.warn('[Capture] Application Number not found on page.');
+      // Save debug screenshot
+      try {
+        const screenshot = await this.driver.takeScreenshot();
+        const ssPath = path.resolve('test-results', 'app-number-debug.png');
+        fs.mkdirSync(path.dirname(ssPath), { recursive: true });
+        fs.writeFileSync(ssPath, screenshot, 'base64');
+        console.log(`[Capture] Debug screenshot: ${ssPath}`);
+      } catch {}
     }
 
-    console.log('[Upload] All documents uploaded. Waiting for Continue button...');
+    return appNo;
+  }
 
-    // Dismiss "Existing Application" popup if it reappears on the upload page
-    const popupFrame = await this.findPopupFrame(5000);
-    if (popupFrame) {
-      console.log('[Upload] Existing application popup detected — dismissing...');
-      await this.handleExistingApplicationPopup(popupFrame);
+  async uploadDocuments(docs: ApplicationDocuments): Promise<void> {
+    console.log('[Upload] Starting document upload...');
+    await this.waitForPageLoad();
+    await this.sleep(3000);
+
+    // Discover what upload elements exist on the page
+    const pageInfo = await this.driver.executeScript<{
+      fileInputs: Array<{ id: string; name: string; attrs: Record<string, string> }>;
+      uploadZones: string[];
+      labels: string[];
+    }>(`
+      var result = { fileInputs: [], uploadZones: [], labels: [] };
+      // All file inputs
+      document.querySelectorAll('input[type="file"]').forEach(function(el) {
+        var attrs = {};
+        for (var i = 0; i < el.attributes.length; i++) {
+          attrs[el.attributes[i].name] = el.attributes[i].value;
+        }
+        result.fileInputs.push({ id: el.id || '', name: el.name || '', attrs: attrs });
+      });
+      // Upload zones / dropzones
+      document.querySelectorAll('[class*="upload"], [class*="dropzone"], [class*="Upload"], [class*="Dropzone"]').forEach(function(el) {
+        result.uploadZones.push(el.className + ' | ' + (el.textContent || '').substring(0, 80).trim());
+      });
+      // Labels that mention document types
+      document.querySelectorAll('label, span.upload-label, .document-label, td, th').forEach(function(el) {
+        var t = (el.textContent || '').trim();
+        if (t && (t.indexOf('Passport') >= 0 || t.indexOf('Photo') >= 0 || t.indexOf('Hotel') >= 0
+            || t.indexOf('ticket') >= 0 || t.indexOf('Ticket') >= 0 || t.indexOf('reservation') >= 0
+            || t.indexOf('Upload') >= 0 || t.indexOf('Attach') >= 0 || t.indexOf('Document') >= 0)) {
+          result.labels.push(t.substring(0, 120));
+        }
+      });
+      return result;
+    `);
+
+    console.log(`[Upload] File inputs found: ${pageInfo.fileInputs.length}`);
+    for (const fi of pageInfo.fileInputs) {
+      console.log(`  - id="${fi.id}" name="${fi.name}" attrs=${JSON.stringify(fi.attrs)}`);
+    }
+    if (pageInfo.uploadZones.length > 0) {
+      console.log(`[Upload] Upload zones: ${pageInfo.uploadZones.length}`);
+      for (const uz of pageInfo.uploadZones.slice(0, 10)) {
+        console.log(`  - ${uz}`);
+      }
+    }
+    if (pageInfo.labels.length > 0) {
+      console.log(`[Upload] Document labels found:`);
+      for (const lbl of pageInfo.labels.slice(0, 15)) {
+        console.log(`  - ${lbl}`);
+      }
     }
 
-    // Continue button appears only after all mandatory uploads are complete
-    const continueBtn = this.page.locator(
-      'input[value="Continue"], button:has-text("Continue"), a:has-text("Continue")'
-    ).first();
-    await continueBtn.waitFor({ state: 'visible', timeout: 60000 });
-    await continueBtn.scrollIntoViewIfNeeded();
-    await continueBtn.click({ force: true, noWaitAfter: true });
-    await this.page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-    await this.waitForLoaderToDisappear();
-    console.log('[Upload] Continue clicked — done.');
-  }
+    // Map document labels to file paths — primary slots first, then Others fallback
+    const slots: Array<{ label: string; keywords: string[]; file: string }> = [
+      { label: 'Sponsored Passport page 1',                keywords: ['sponsored', 'passport page', 'passport page 1'], file: docs.sponsoredPassportPage1 },
+      { label: 'Passport External Cover Page',             keywords: ['cover', 'external cover'],                       file: docs.passportExternalCoverPage },
+      { label: 'Personal Photo',                           keywords: ['photo', 'personal photo'],                       file: docs.personalPhoto },
+      { label: 'Hotel reservation/Place of stay - Page 1', keywords: ['hotel', 'reservation', 'place of stay'],         file: docs.hotelReservationPage1 },
+      { label: 'Return air ticket - Page 1',               keywords: ['ticket', 'air ticket', 'return'],                file: docs.returnAirTicketPage1 },
+    ];
 
-  private async findFileInput(label: string) {
-    let fileInput = this.page.locator(`input[type="file"][data-document-type="${label}"]`);
-    if (await fileInput.count() > 0) return fileInput;
+    // Build a list of available data-document-types on the page
+    const availableTypes = await this.driver.executeScript<string[]>(`
+      return Array.from(document.querySelectorAll('input[type="file"][data-document-type]'))
+        .map(function(el) { return el.getAttribute('data-document-type') || ''; });
+    `);
+    console.log('[Upload] Available upload slot types:', availableTypes);
 
-    // Fallback: case-insensitive search via evaluate
-    const matchIdx = await this.page.evaluate((lbl: string) => {
-      const inputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"][data-document-type]'));
-      const target = lbl.toLowerCase();
-      return inputs.findIndex(el => (el.getAttribute('data-document-type') ?? '').toLowerCase() === target);
-    }, label);
+    // If hotel/flight slots don't exist, try uploading to "Others Page 1" and "Others Page 2"
+    const hotelSlotExists = availableTypes.some(t => t.toLowerCase().includes('hotel') || t.toLowerCase().includes('reservation'));
+    const ticketSlotExists = availableTypes.some(t => t.toLowerCase().includes('ticket') || t.toLowerCase().includes('air ticket'));
 
-    if (matchIdx < 0) return null;
-    return this.page.locator('input[type="file"][data-document-type]').nth(matchIdx);
-  }
-
-  private async isUploadSlotFilled(label: string): Promise<boolean> {
-    return this.page.evaluate((lbl: string) => {
-      const input = document.querySelector<HTMLInputElement>(
-        `input[type="file"][data-document-type="${lbl}"]`
-      ) ?? Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"][data-document-type]'))
-        .find(el => (el.getAttribute('data-document-type') ?? '').toLowerCase() === lbl.toLowerCase());
-      if (!input) return false;
-      // Walk up to the slot container and check if "Drag here" prompt is gone
-      const container = input.closest('[class*="upload"], [class*="dropzone"], [class*="Upload"]')
-        || input.parentElement?.parentElement?.parentElement;
-      if (!container) return false;
-      return !container.textContent?.includes('Drag here or click to upload');
-    }, label);
-  }
-
-  private async uploadSingleDocument(label: string, filePath: string): Promise<void> {
-    const fileInput = await this.findFileInput(label);
-    if (!fileInput) {
-      console.warn(`[Upload] Slot not found on page: "${label}"`);
-      return;
+    if (!hotelSlotExists && docs.hotelReservationPage1) {
+      console.log('[Upload] No hotel slot found — will try "Others Page 1"');
+      // Replace the hotel slot to target "Others Page 1"
+      const hotelIdx = slots.findIndex(s => s.label.includes('Hotel'));
+      if (hotelIdx >= 0) {
+        slots[hotelIdx] = { label: 'Others Page 1', keywords: ['others page 1', 'others'], file: docs.hotelReservationPage1 };
+      }
+    }
+    if (!ticketSlotExists && docs.returnAirTicketPage1) {
+      console.log('[Upload] No ticket slot found — will try "Others Page 2"');
+      const ticketIdx = slots.findIndex(s => s.label.includes('Return'));
+      if (ticketIdx >= 0) {
+        slots[ticketIdx] = { label: 'Others Page 2', keywords: ['others page 2', 'others'], file: docs.returnAirTicketPage1 };
+      }
     }
 
-    const maxAttempts = 3;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      await fileInput.scrollIntoViewIfNeeded().catch(() => {});
-      await fileInput.setInputFiles(filePath);
-
-      if (attempt > 1) {
-        // On retry, also dispatch change event and click Submit as fallback
-        await fileInput.dispatchEvent('change');
-        const submitBtn = fileInput.locator('xpath=ancestor::div[.//button]//button[contains(text(),"Submit")]');
-        if (await submitBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
-          await submitBtn.click();
+    if (pageInfo.fileInputs.length === 0) {
+      // No file inputs found — try to find them inside iframes
+      console.log('[Upload] No file inputs in main page — checking iframes...');
+      const iframes = await this.driver.findElements(By.css('iframe'));
+      for (let i = 0; i < iframes.length; i++) {
+        try {
+          await this.driver.switchTo().frame(iframes[i]);
+          const iframeInputs = await this.driver.findElements(By.css('input[type="file"]'));
+          if (iframeInputs.length > 0) {
+            console.log(`[Upload] Found ${iframeInputs.length} file input(s) in iframe ${i}`);
+            // Upload from within this iframe
+            await this.uploadInCurrentContext(slots);
+            await this.driver.switchTo().defaultContent();
+            console.log('[Upload] Iframe uploads complete.');
+            return;
+          }
+          await this.driver.switchTo().defaultContent();
+        } catch {
+          try { await this.driver.switchTo().defaultContent(); } catch {}
         }
       }
 
-      // Wait for the upload to process
-      await this.page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-
-      // Verify the upload took effect
-      const filled = await this.isUploadSlotFilled(label);
-      if (filled) {
-        console.log(`[Upload] "${label}": ${path.basename(filePath)}`);
-        return;
-      }
-
-      if (attempt < maxAttempts) {
-        console.log(`[Upload] "${label}" still empty — retrying (attempt ${attempt + 1}/${maxAttempts})...`);
-        await this.page.waitForTimeout(1000);
-      }
+      // Still no inputs — try clicking upload/attach buttons first
+      console.log('[Upload] No file inputs in iframes either. Looking for upload buttons...');
+      await this.driver.executeScript(`
+        var btns = document.querySelectorAll('a, button, input[type="button"]');
+        for (var i = 0; i < btns.length; i++) {
+          var t = (btns[i].textContent || btns[i].value || '').trim().toLowerCase();
+          if (t.indexOf('upload') >= 0 || t.indexOf('attach') >= 0 || t.indexOf('browse') >= 0) {
+            console.log('Clicking: ' + t);
+          }
+        }
+      `);
+      console.warn('[Upload] Could not find any file upload mechanism on the page.');
+      // Take a diagnostic screenshot
+      try {
+        const screenshot = await this.driver.takeScreenshot();
+        const ssPath = path.resolve('test-results', 'upload-page-debug.png');
+        fs.mkdirSync(path.dirname(ssPath), { recursive: true });
+        fs.writeFileSync(ssPath, screenshot, 'base64');
+        console.log(`[Upload] Debug screenshot saved: ${ssPath}`);
+      } catch {}
+      return;
     }
 
-    // Log even if verification failed — setInputFiles may have worked but DOM check is unreliable
-    console.warn(`[Upload] "${label}": ${path.basename(filePath)} (unverified — slot may still appear empty)`);
+    // Upload using the discovered file inputs
+    await this.uploadInCurrentContext(slots);
+
+    // Take a screenshot to verify uploads
+    try {
+      const screenshot = await this.driver.takeScreenshot();
+      const ssPath = path.resolve('test-results', 'after-upload.png');
+      fs.mkdirSync(path.dirname(ssPath), { recursive: true });
+      fs.writeFileSync(ssPath, screenshot, 'base64');
+      console.log(`[Upload] Post-upload screenshot: ${ssPath}`);
+    } catch {}
+
+    console.log('[Upload] All documents uploaded. Waiting before Continue...');
+    await this.sleep(5000);
+
+    // Look for Continue button — OutSystems uses various patterns
+    await this.clickContinueButton();
+  }
+
+  /**
+   * Finds and clicks the Continue button on the upload/attachments page.
+   * Tries multiple selector strategies for OutSystems portal.
+   */
+  private async clickContinueButton(): Promise<void> {
+    const strategies = [
+      // OutSystems common button patterns
+      `input[value="Continue"]`,
+      `input[value="continue"]`,
+      `a[id*="Continue"], a[id*="continue"]`,
+      `input[id*="Continue"], input[id*="continue"]`,
+      `button[id*="Continue"], button[id*="continue"]`,
+      // Static ID patterns
+      `[data-staticid*="Continue"], [data-staticid*="continue"]`,
+      `[staticid*="Continue"], [staticid*="continue"]`,
+      // By text content via XPath is not CSS — handle separately
+    ];
+
+    for (const selector of strategies) {
+      try {
+        const btn = await this.driver.findElement(By.css(selector));
+        const displayed = await btn.isDisplayed().catch(() => false);
+        if (displayed) {
+          await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', btn);
+          await this.sleep(500);
+          await btn.click();
+          await this.waitForPageLoad();
+          await this.waitForLoaderToDisappear();
+          console.log(`[Upload] Continue clicked (${selector}).`);
+          return;
+        }
+      } catch {}
+    }
+
+    // Try finding by text content
+    try {
+      const continueBtn = await this.driver.executeScript<WebElement | null>(`
+        var allBtns = document.querySelectorAll('input[type="submit"], input[type="button"], button, a.btn, a.button, a[class*="btn"]');
+        for (var i = 0; i < allBtns.length; i++) {
+          var text = (allBtns[i].textContent || allBtns[i].value || '').trim().toLowerCase();
+          if (text === 'continue' || text === 'next' || text === 'submit') {
+            return allBtns[i];
+          }
+        }
+        return null;
+      `);
+      if (continueBtn) {
+        await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', continueBtn);
+        await this.sleep(500);
+        await (continueBtn as WebElement).click();
+        await this.waitForPageLoad();
+        await this.waitForLoaderToDisappear();
+        console.log('[Upload] Continue clicked (text match).');
+        return;
+      }
+    } catch {}
+
+    console.log('[Upload] No Continue button found — page may have auto-advanced.');
+    // Save debug screenshot
+    try {
+      const screenshot = await this.driver.takeScreenshot();
+      const ssPath = path.resolve('test-results', 'continue-btn-debug.png');
+      fs.mkdirSync(path.dirname(ssPath), { recursive: true });
+      fs.writeFileSync(ssPath, screenshot, 'base64');
+      console.log(`[Upload] Continue button debug screenshot: ${ssPath}`);
+    } catch {}
+  }
+
+  /**
+   * Uploads a single file to a file input element.
+   * Makes the input visible, sends the file path, dispatches change event,
+   * and waits for upload to complete.
+   */
+  private async uploadFileToInput(input: WebElement, filePath: string, label: string): Promise<boolean> {
+    try {
+      // 1. Make the file input visible and interactable via JS
+      await this.driver.executeScript(`
+        var el = arguments[0];
+        el.style.display = 'block';
+        el.style.visibility = 'visible';
+        el.style.opacity = '1';
+        el.style.position = 'absolute';
+        el.style.width = '200px';
+        el.style.height = '40px';
+        el.style.zIndex = '99999';
+        el.style.left = '0px';
+        el.style.top = '0px';
+        el.removeAttribute('disabled');
+        el.removeAttribute('readonly');
+        // Also unhide any parent that may be hiding it
+        var parent = el.parentElement;
+        for (var i = 0; i < 5 && parent; i++) {
+          if (window.getComputedStyle(parent).display === 'none' ||
+              window.getComputedStyle(parent).visibility === 'hidden' ||
+              window.getComputedStyle(parent).overflow === 'hidden') {
+            parent.style.display = 'block';
+            parent.style.visibility = 'visible';
+            parent.style.overflow = 'visible';
+            parent.style.height = 'auto';
+            parent.style.width = 'auto';
+          }
+          parent = parent.parentElement;
+        }
+      `, input);
+      await this.sleep(500);
+
+      // 2. Scroll into view
+      await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', input);
+      await this.sleep(300);
+
+      // 3. Send the file path
+      await input.sendKeys(filePath);
+      console.log(`[Upload] sendKeys done for "${label}": ${path.basename(filePath)}`);
+
+      // 4. Dispatch change and input events to trigger the framework's upload handler
+      await this.driver.executeScript(`
+        var el = arguments[0];
+        var changeEvent = new Event('change', { bubbles: true });
+        el.dispatchEvent(changeEvent);
+        var inputEvent = new Event('input', { bubbles: true });
+        el.dispatchEvent(inputEvent);
+      `, input);
+
+      // 5. Wait for upload to process — check for progress indicators
+      console.log(`[Upload] Waiting for "${label}" to upload...`);
+      await this.sleep(3000);
+
+      // Wait up to 30 seconds for upload completion
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const uploadState = await this.driver.executeScript<{
+          hasProgress: boolean;
+          hasSpinner: boolean;
+          hasFileName: boolean;
+          fileNameText: string;
+        }>(`
+          var result = { hasProgress: false, hasSpinner: false, hasFileName: false, fileNameText: '' };
+          // Check for progress bars / spinners
+          var spinners = document.querySelectorAll('.loading, .spinner, .progress, [class*="loading"], [class*="progress"], [class*="uploading"]');
+          result.hasSpinner = spinners.length > 0;
+          for (var i = 0; i < spinners.length; i++) {
+            if (window.getComputedStyle(spinners[i]).display !== 'none') {
+              result.hasProgress = true;
+              break;
+            }
+          }
+          // Check if file name appears near the input (upload complete indicator)
+          var el = arguments[0];
+          var container = el.closest('.upload-container, .file-upload, [class*="upload"], [class*="attach"], div') || el.parentElement;
+          if (container) {
+            var text = container.textContent || '';
+            var basename = arguments[1];
+            if (text.indexOf(basename) >= 0 || text.indexOf('.jpg') >= 0 || text.indexOf('.pdf') >= 0 || text.indexOf('.png') >= 0) {
+              result.hasFileName = true;
+              result.fileNameText = text.substring(0, 150).trim();
+            }
+          }
+          return result;
+        `, input, path.basename(filePath));
+
+        if (uploadState.hasFileName) {
+          console.log(`[Upload] "${label}" upload confirmed — file name visible.`);
+          break;
+        }
+        if (uploadState.hasProgress) {
+          console.log(`[Upload] "${label}" still uploading... (attempt ${attempt + 1})`);
+          await this.sleep(3000);
+        } else {
+          // No progress indicator and no file name — upload may have completed quickly
+          // or the site uses a different indicator. Wait a bit more and move on.
+          await this.sleep(2000);
+          break;
+        }
+      }
+
+      await this.waitForPageLoad();
+      await this.sleep(2000);
+      return true;
+    } catch (err) {
+      console.error(`[Upload] Error uploading "${label}":`, err);
+      return false;
+    }
+  }
+
+  /**
+   * Uploads documents using file inputs found in the current browsing context.
+   * Matches slots to file inputs by: data-document-type, nearby label text, or input order.
+   */
+  private async uploadInCurrentContext(
+    slots: Array<{ label: string; keywords: string[]; file: string }>
+  ): Promise<void> {
+    const fileInputs = await this.driver.findElements(By.css('input[type="file"]'));
+    console.log(`[Upload] ${fileInputs.length} file input(s) in current context.`);
+
+    // Try matching by data-document-type attribute first
+    const hasDataAttr = await this.driver.executeScript<boolean>(`
+      return document.querySelectorAll('input[type="file"][data-document-type]').length > 0;
+    `);
+
+    if (hasDataAttr) {
+      // Use data-document-type matching
+      for (const slot of slots) {
+        if (!slot.file) continue;
+        const filePath = path.resolve(slot.file);
+        if (!fs.existsSync(filePath)) { console.warn(`[Upload] File missing: ${filePath}`); continue; }
+        const input = await this.findFileInputByAttr(slot.label);
+        if (input) {
+          await this.uploadFileToInput(input, filePath, slot.label);
+        } else {
+          // Try partial / fuzzy matching on data-document-type
+          const fuzzyInput = await this.findFileInputByFuzzyAttr(slot.label, slot.keywords);
+          if (fuzzyInput) {
+            await this.uploadFileToInput(fuzzyInput, filePath, slot.label);
+          } else {
+            console.warn(`[Upload] No slot for: "${slot.label}"`);
+          }
+        }
+      }
+    } else {
+      // Match by nearby label/text or sequential order
+      const inputContexts = await this.driver.executeScript<string[]>(`
+        return Array.from(document.querySelectorAll('input[type="file"]')).map(function(el) {
+          var container = el.closest('div, td, tr, li, section') || el.parentElement;
+          var text = container ? container.textContent.trim().substring(0, 200) : '';
+          return text;
+        });
+      `);
+
+      console.log('[Upload] File input contexts:');
+      for (let i = 0; i < inputContexts.length; i++) {
+        console.log(`  [${i}] ${inputContexts[i].substring(0, 100)}`);
+      }
+
+      // Match each slot to an input by keyword matching
+      const usedIndices = new Set<number>();
+      for (const slot of slots) {
+        if (!slot.file) continue;
+        const filePath = path.resolve(slot.file);
+        if (!fs.existsSync(filePath)) { console.warn(`[Upload] File missing: ${filePath}`); continue; }
+
+        let bestIdx = -1;
+        for (let i = 0; i < inputContexts.length; i++) {
+          if (usedIndices.has(i)) continue;
+          const ctx = inputContexts[i].toLowerCase();
+          if (slot.keywords.some(kw => ctx.includes(kw.toLowerCase()))) {
+            bestIdx = i;
+            break;
+          }
+        }
+
+        if (bestIdx >= 0) {
+          usedIndices.add(bestIdx);
+          const input = fileInputs[bestIdx];
+          await this.uploadFileToInput(input, filePath, slot.label);
+        } else {
+          console.warn(`[Upload] No matching input for: "${slot.label}"`);
+        }
+      }
+    }
+  }
+
+  private async findFileInputByAttr(label: string): Promise<WebElement | null> {
+    try {
+      return await this.driver.findElement(By.css(`input[type="file"][data-document-type="${label}"]`));
+    } catch {
+      const matchIdx = await this.driver.executeScript<number>(`
+        var inputs = Array.from(document.querySelectorAll('input[type="file"][data-document-type]'));
+        var target = arguments[0].toLowerCase();
+        return inputs.findIndex(function(el) { return (el.getAttribute('data-document-type') || '').toLowerCase() === target; });
+      `, label);
+      if (matchIdx < 0) return null;
+      const inputs = await this.driver.findElements(By.css('input[type="file"][data-document-type]'));
+      return inputs[matchIdx] || null;
+    }
+  }
+
+  /**
+   * Fuzzy match: finds a file input whose data-document-type contains any of the keywords.
+   */
+  private async findFileInputByFuzzyAttr(label: string, keywords: string[]): Promise<WebElement | null> {
+    const matchIdx = await this.driver.executeScript<number>(`
+      var inputs = Array.from(document.querySelectorAll('input[type="file"][data-document-type]'));
+      var keywords = arguments[0];
+      for (var k = 0; k < keywords.length; k++) {
+        var kw = keywords[k].toLowerCase();
+        for (var i = 0; i < inputs.length; i++) {
+          var dtype = (inputs[i].getAttribute('data-document-type') || '').toLowerCase();
+          if (dtype.indexOf(kw) >= 0) return i;
+        }
+      }
+      return -1;
+    `, keywords);
+    if (matchIdx < 0) return null;
+    const inputs = await this.driver.findElements(By.css('input[type="file"][data-document-type]'));
+    return inputs[matchIdx] || null;
   }
 
   // ── Navigation ─────────────────────────────────────────────────────────────
@@ -202,10 +634,25 @@ export class GdrfaPortalPage {
   private async dismissPromoPopup(): Promise<void> {
     const SKIP_ID = 'WebPatterns_wt2_block_wtMainContent_wt3_EmaratechSG_Patterns_wt8_block_wtMainContent_wt10';
     try {
-      const skipBtn = this.page.frameLocator('iframe').locator(`#${SKIP_ID}, input[value="Skip"]`).first();
-      if (!await skipBtn.isVisible({ timeout: 3000 }).catch(() => false)) return;
-      await skipBtn.click();
-      console.log('[Nav] Dismissed promotional popup.');
+      // Check for iframe popup
+      const iframes = await this.driver.findElements(By.css('iframe'));
+      for (const iframe of iframes) {
+        try {
+          await this.driver.switchTo().frame(iframe);
+          const skipBtns = await this.driver.findElements(By.css(`#${SKIP_ID}, input[value="Skip"]`));
+          for (const btn of skipBtns) {
+            if (await btn.isDisplayed().catch(() => false)) {
+              await btn.click();
+              console.log('[Nav] Dismissed promotional popup.');
+              await this.driver.switchTo().defaultContent();
+              return;
+            }
+          }
+          await this.driver.switchTo().defaultContent();
+        } catch {
+          await this.driver.switchTo().defaultContent();
+        }
+      }
     } catch { /* non-fatal — popup does not appear on every load */ }
   }
 
@@ -213,15 +660,27 @@ export class GdrfaPortalPage {
     console.log('[Nav] Navigating to Existing Applications...');
     await this.dismissPromoPopup();
 
-    await this.page.locator(
-      '#EmaratechSG_Theme_wtwbLayoutEmaratech_block_wtMainContent_wtwbDashboard_wtCntExistApp, ' +
-      'a:has-text("Existing Applications")'
-    ).first().click({ timeout: 15000 });
+    // Click "Existing Applications"
+    const existAppSel = '#EmaratechSG_Theme_wtwbLayoutEmaratech_block_wtMainContent_wtwbDashboard_wtCntExistApp';
+    let clicked = false;
+    try {
+      const el = await this.waitForElement(By.css(existAppSel), 15000);
+      await el.click();
+      clicked = true;
+    } catch {
+      // Fallback: click by link text
+      try {
+        const link = await this.driver.findElement(By.partialLinkText('Existing Applications'));
+        await link.click();
+        clicked = true;
+      } catch {}
+    }
 
-    // Wait for the establishment detail page to fully load (avoids race with secondary redirects)
-    await this.page.waitForURL('**/EstablishmentDetail**', { timeout: 20000 }).catch(() => {});
-    await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
-    await this.page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    if (!clicked) throw new Error('[Nav] Could not find Existing Applications link');
+
+    // Wait for the establishment detail page to fully load
+    await this.waitForUrlContains('EstablishmentDetail', 20000).catch(() => {});
+    await this.waitForPageLoad();
     await this.dismissPromoPopup();
 
     const dropdownSel =
@@ -229,67 +688,122 @@ export class GdrfaPortalPage {
     const firstOptionSel =
       '#EmaratechSG_Theme_wtwbLayoutEmaratechWithoutTitle_block_wtMainContent_EmaratechSG_Patterns_wtwbEstbButtonWithContextInfo_block_wtContent_wtwbEstbTopServices_wtListMyServicesExperiences_ctl00_wtStartTopService';
 
-    const dropdown = this.page.locator(dropdownSel);
-    const dropdownVisible = await dropdown.waitFor({ state: 'visible', timeout: 15000 })
-      .then(() => true).catch(() => false);
+    let dropdownVisible = false;
+    try {
+      const dropdown = await this.waitForElement(By.css(dropdownSel), 15000);
+      dropdownVisible = await dropdown.isDisplayed();
+    } catch {}
 
     if (dropdownVisible) {
+      const dropdown = await this.driver.findElement(By.css(dropdownSel));
       await dropdown.click();
-      await this.page.waitForTimeout(150);
+      await this.sleep(150);
 
-      const firstOption = this.page.locator(firstOptionSel);
-      await firstOption.waitFor({ state: 'visible', timeout: 10000 });
-      console.log(`[Nav] Selecting form: "${(await firstOption.textContent())?.trim()}"`);
+      const firstOption = await this.waitForElement(By.css(firstOptionSel), 10000);
+      const optionText = await firstOption.getText();
+      console.log(`[Nav] Selecting form: "${optionText.trim()}"`);
       await firstOption.click();
     } else {
-      // Fallback: dropdown ID not found — click "New Application" button then first service link
+      // Fallback: dropdown ID not found
       console.log('[Nav] Dropdown not found — using fallback navigation.');
-      const newAppBtn = this.page.locator('button:has-text("New Application")');
-      if (await newAppBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-        await newAppBtn.click();
-        await this.page.waitForTimeout(300);
+      try {
+        const newAppBtn = await this.driver.findElement(By.xpath('//button[contains(text(),"New Application")]'));
+        if (await newAppBtn.isDisplayed().catch(() => false)) {
+          await newAppBtn.click();
+          await this.sleep(300);
+        }
+      } catch {}
+
+      let firstService: WebElement;
+      try {
+        firstService = await this.driver.findElement(By.css(firstOptionSel));
+      } catch {
+        firstService = await this.driver.findElement(By.partialLinkText('New Tourism Entry Permit'));
       }
-      const firstService = this.page.locator(
-        `${firstOptionSel}, a:has-text("New Tourism Entry Permit")`
-      ).first();
-      await firstService.waitFor({ state: 'visible', timeout: 10000 });
-      console.log(`[Nav] Selecting form (fallback): "${(await firstService.textContent())?.trim()}"`);
+      await this.driver.wait(until.elementIsVisible(firstService), 10000);
+      const serviceText = await firstService.getText();
+      console.log(`[Nav] Selecting form (fallback): "${serviceText.trim()}"`);
       await firstService.click();
     }
 
-    await this.page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-    console.log('[Nav] Form page loaded. URL:', this.page.url());
+    await this.waitForPageLoad();
+    const currentUrl = await this.driver.getCurrentUrl();
+    console.log('[Nav] Form page loaded. URL:', currentUrl);
   }
 
   private async waitForPageSettle(): Promise<void> {
-    await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
-    await this.page.waitForLoadState('networkidle',      { timeout: 15000 }).catch(() => {});
+    await this.waitForPageLoad();
   }
 
   // ── Passport header (Passport Type → Nationality → Search Data) ────────────
 
   private async setVisitReason(): Promise<void> {
     console.log('[Form] Selecting Visit Reason → Tourism...');
-    // The select may be offscreen (in Visit Details section) — wait for DOM attachment, then scroll
-    const sel = this.page.locator('select[data-staticid="cmbVisitReason"]');
-    const attached = await sel.waitFor({ state: 'attached', timeout: 15000 }).then(() => true).catch(() => false);
-    if (!attached) {
-      console.log('[Form] Visit Reason select not found — likely pre-set by form type. Skipping.');
-      return;
-    }
-    await sel.scrollIntoViewIfNeeded().catch(() => {});
-    const set = await this.page.evaluate(() => {
-      const sel = document.querySelector<HTMLSelectElement>('select[data-staticid="cmbVisitReason"]');
-      if (!sel) return false;
-      // Skip if already set to Tourism
-      const currentText = sel.options[sel.selectedIndex]?.text?.trim() ?? '';
-      if (currentText.toUpperCase().includes('TOURISM')) return true;
-      sel.value = '1'; // 1 = Tourism
+    const set = await this.driver.executeScript<boolean>(`
+      // Try multiple selectors for Visit Reason
+      var sel = document.querySelector('select[data-staticid="cmbVisitReason"]')
+        || document.querySelector('select[id*="VisitReason"]')
+        || document.querySelector('select[id*="visitReason"]')
+        || document.querySelector('select[name*="VisitReason"]');
+
+      // Fallback: find by label text
+      if (!sel) {
+        var labels = Array.from(document.querySelectorAll('label'));
+        var lbl = labels.find(function(l) {
+          var t = (l.textContent || '').trim().toLowerCase();
+          return t.indexOf('visit') >= 0 && t.indexOf('reason') >= 0;
+        });
+        if (lbl && lbl.htmlFor) {
+          var el = document.getElementById(lbl.htmlFor);
+          sel = (el instanceof HTMLSelectElement) ? el
+            : (el && el.parentElement ? el.parentElement.querySelector('select') : null);
+        }
+      }
+
+      // Last fallback: find the first select in "Visit Details" section
+      if (!sel) {
+        var sections = document.querySelectorAll('a[href*="Visit"], span, div, td');
+        for (var i = 0; i < sections.length; i++) {
+          if ((sections[i].textContent || '').trim() === 'Visit Details') {
+            var container = sections[i].closest('div, section, table');
+            if (container) {
+              var selects = container.querySelectorAll('select');
+              if (selects.length > 0) { sel = selects[0]; break; }
+            }
+          }
+        }
+      }
+
+      if (!sel) {
+        // Debug: log all selects on page
+        var allSelects = document.querySelectorAll('select');
+        console.log('All selects on page: ' + allSelects.length);
+        allSelects.forEach(function(s, i) {
+          var opts = Array.from(s.options).map(function(o) { return o.text.trim(); }).slice(0, 5).join(', ');
+          console.log('  select[' + i + '] id=' + s.id + ' opts: ' + opts);
+        });
+        return false;
+      }
+
+      var currentText = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].text.trim() : '';
+      if (currentText.toUpperCase().indexOf('TOURISM') >= 0) return true;
+
+      // Find the Tourism option
+      var tourismOpt = Array.from(sel.options).find(function(o) {
+        return o.text.trim().toUpperCase().indexOf('TOURISM') >= 0;
+      });
+      if (tourismOpt) {
+        sel.value = tourismOpt.value;
+      } else {
+        // Try value '1' as fallback
+        sel.value = '1';
+      }
       sel.dispatchEvent(new Event('change', { bubbles: true }));
       return true;
-    });
+    `);
     if (set) {
-      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      await this.waitForPageLoad();
+      await this.sleep(1000);
       console.log('[Form] Visit Reason → Tourism.');
     } else {
       console.warn('[Form] Visit Reason select not found.');
@@ -298,21 +812,53 @@ export class GdrfaPortalPage {
 
   private async setPassportType(passportType: string): Promise<void> {
     console.log(`[Form] Setting Passport Type: "${passportType}"...`);
-    const set = await this.page.evaluate((type: string) => {
-      // Passport Type select is identified by having "Normal" as one of its options
-      const sel = Array.from(document.querySelectorAll<HTMLSelectElement>('select')).find(s =>
-        Array.from(s.options).some(o => o.text.trim() === 'Normal')
-      );
+    const set = await this.driver.executeScript<boolean>(`
+      var type = arguments[0];
+
+      // Try specific selectors first
+      var sel = document.querySelector('select[data-staticid*="PassportType"]')
+        || document.querySelector('select[id*="PassportType"]')
+        || document.querySelector('select[id*="passportType"]')
+        || document.querySelector('select[name*="PassportType"]');
+
+      // Fallback: find by label "Passport Type"
+      if (!sel) {
+        var labels = Array.from(document.querySelectorAll('label'));
+        var lbl = labels.find(function(l) {
+          var t = (l.textContent || '').replace(/\\*/, '').trim().toLowerCase();
+          return t === 'passport type';
+        });
+        if (lbl && lbl.htmlFor) {
+          var el = document.getElementById(lbl.htmlFor);
+          sel = (el instanceof HTMLSelectElement) ? el
+            : (el && el.parentElement ? el.parentElement.querySelector('select') : null);
+        }
+      }
+
+      // Last fallback: find any select that has "Normal" as an option
+      if (!sel) {
+        var allSels = Array.from(document.querySelectorAll('select'));
+        sel = allSels.find(function(s) {
+          return Array.from(s.options).some(function(o) {
+            return o.text.trim().toLowerCase() === 'normal';
+          });
+        }) || null;
+      }
+
       if (!sel) return false;
-      const match = Array.from(sel.options).find(o => o.text.trim().toLowerCase() === type.toLowerCase());
+
+      var match = Array.from(sel.options).find(function(o) {
+        return o.text.trim().toLowerCase() === type.toLowerCase();
+      });
       if (!match) return false;
       sel.value = match.value;
       sel.dispatchEvent(new Event('change', { bubbles: true }));
       return true;
-    }, passportType);
+    `, passportType);
     if (set) {
-      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-      console.log('[Form] Passport Type set.');
+      await this.waitForPageLoad();
+      await this.sleep(500);
+      console.log('[Form] Passport Type set: ' + passportType);
     } else {
       console.warn('[Form] Passport Type select not found.');
     }
@@ -320,33 +866,34 @@ export class GdrfaPortalPage {
 
   private async enterPassportNumber(passportNumber: string): Promise<void> {
     console.log(`[Form] Entering Passport Number: "${passportNumber}"...`);
-    const input = this.page.locator(
-      'input[staticid*="PassportNo"], input[id*="inptPassportNo"], input[id*="PassportNo"]'
-    ).first();
-    await input.waitFor({ state: 'attached', timeout: 15000 });
-    await input.scrollIntoViewIfNeeded().catch(() => {});
-    await input.fill(passportNumber);
+    const input = await this.waitForElement(
+      By.css('input[staticid*="PassportNo"], input[id*="inptPassportNo"], input[id*="PassportNo"]'),
+      15000
+    );
+    await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', input);
+    await input.clear();
+    await input.sendKeys(passportNumber);
     console.log('[Form] Passport Number entered.');
   }
 
   private async setNationality(nationalityCode: string): Promise<void> {
     const name = GdrfaPortalPage.mrzCodeToCountryName(nationalityCode);
     console.log(`[Form] Setting Nationality: "${name}"...`);
-    const result = await this.page.evaluate((search: string) => {
-      // Nationality selects have options formatted as "NNN - COUNTRY NAME"
-      const sel = Array.from(document.querySelectorAll<HTMLSelectElement>('select')).find(s =>
-        Array.from(s.options).some(o => /^\d+ - /.test(o.text.trim()))
-      );
+    const result = await this.driver.executeScript<{ found: boolean; matched: string }>(`
+      var search = arguments[0];
+      var sel = Array.from(document.querySelectorAll('select')).find(function(s) {
+        return Array.from(s.options).some(function(o) { return /^\\d+ - /.test(o.text.trim()); });
+      });
       if (!sel) return { found: false, matched: '' };
       sel.removeAttribute('disabled');
-      const match = Array.from(sel.options).find(o => o.text.toUpperCase().includes(search.toUpperCase()));
+      var match = Array.from(sel.options).find(function(o) { return o.text.toUpperCase().indexOf(search.toUpperCase()) >= 0; });
       if (!match) return { found: false, matched: '' };
       sel.value = match.value;
       sel.dispatchEvent(new Event('change', { bubbles: true }));
       return { found: true, matched: match.text };
-    }, name);
+    `, name);
     if (result.found) {
-      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      await this.waitForPageLoad();
       console.log(`[Form] Nationality set: "${result.matched}".`);
     } else {
       console.warn(`[Form] Nationality not found for: "${name}".`);
@@ -356,18 +903,19 @@ export class GdrfaPortalPage {
   private async setPreviousNationality(nationalityCode: string): Promise<void> {
     const name = GdrfaPortalPage.mrzCodeToCountryName(nationalityCode);
     console.log(`[Form] Setting Previous Nationality: "${name}"...`);
-    const result = await this.page.evaluate((search: string) => {
-      const sel = document.querySelector<HTMLSelectElement>('select[id*="wtcmbApplicantPreviousNationality"]');
+    const result = await this.driver.executeScript<{ found: boolean; matched: string }>(`
+      var search = arguments[0];
+      var sel = document.querySelector('select[id*="wtcmbApplicantPreviousNationality"]');
       if (!sel) return { found: false, matched: '' };
       sel.removeAttribute('disabled');
-      const match = Array.from(sel.options).find(o => o.text.toUpperCase().includes(search.toUpperCase()));
+      var match = Array.from(sel.options).find(function(o) { return o.text.toUpperCase().indexOf(search.toUpperCase()) >= 0; });
       if (!match) return { found: false, matched: '' };
       sel.value = match.value;
       sel.dispatchEvent(new Event('change', { bubbles: true }));
       return { found: true, matched: match.text };
-    }, name);
+    `, name);
     if (result.found) {
-      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      await this.waitForPageLoad();
       console.log(`[Form] Previous Nationality set: "${result.matched}".`);
     } else {
       console.warn(`[Form] Previous Nationality not found for: "${name}".`);
@@ -376,21 +924,21 @@ export class GdrfaPortalPage {
 
   private async clickSearchDataAndWait(): Promise<void> {
     console.log('[Form] Clicking Search Data...');
-    const btn = this.page.locator(
-      'a:has-text("Search Data"), button:has-text("Search Data"), input[value="Search Data"]'
-    ).first();
-    await btn.waitFor({ state: 'visible', timeout: 10000 });
+    const btn = await this.waitForElement(
+      By.xpath('//a[contains(text(),"Search Data")] | //button[contains(text(),"Search Data")] | //input[@value="Search Data"]'),
+      10000
+    );
     await btn.click();
-    // Wait for the portal AJAX call to populate SmartInput fields and re-render widgets
-    await this.page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+    // Wait for the portal AJAX call to populate SmartInput fields
+    await this.waitForPageLoad();
 
     // Wait for key passport input fields to appear in the DOM
     console.log('[Form] Waiting for passport fields to load...');
     await Promise.all([
-      this.page.locator('input[data-staticid="inpFirsttNameEn"]').waitFor({ state: 'attached', timeout: 20000 }),
-      this.page.locator('input[data-staticid="inpLastNameEn"]').waitFor({ state: 'attached', timeout: 20000 }),
-      this.page.locator('input[data-staticid="inpDateOfBirth"]').waitFor({ state: 'attached', timeout: 20000 }),
-      this.page.locator('input[data-staticid="inpPassportExpiryDate"]').waitFor({ state: 'attached', timeout: 20000 }),
+      this.waitForElement(By.css('input[data-staticid="inpFirsttNameEn"]'), 20000),
+      this.waitForElement(By.css('input[data-staticid="inpLastNameEn"]'), 20000),
+      this.waitForElement(By.css('input[data-staticid="inpDateOfBirth"]'), 20000),
+      this.waitForElement(By.css('input[data-staticid="inpPassportExpiryDate"]'), 20000),
     ]);
     console.log('[Form] Search Data complete — passport fields populated.');
   }
@@ -406,8 +954,8 @@ export class GdrfaPortalPage {
     console.log(`[Form] Filling First Name: "${passport.firstName}"...`);
     const firstFilled = await this.editAndFill('inpFirsttNameEn', passport.firstName);
     if (firstFilled) {
-      await this.page.evaluate(() => (window as any).translateInputText?.('inpFirsttNameEn'));
-      await this.page.waitForTimeout(200);
+      await this.driver.executeScript(`if (window.translateInputText) translateInputText('inpFirsttNameEn');`);
+      await this.sleep(200);
       console.log('[Form] First Name filled + translated.');
     }
 
@@ -415,8 +963,8 @@ export class GdrfaPortalPage {
       console.log(`[Form] Filling Middle Name: "${passport.middleName}"...`);
       const midFilled = await this.editAndFill('inpMiddleNameEn', passport.middleName);
       if (midFilled) {
-        await this.page.evaluate(() => (window as any).translateInputText?.('inpMiddleNameEn'));
-        await this.page.waitForTimeout(200);
+        await this.driver.executeScript(`if (window.translateInputText) translateInputText('inpMiddleNameEn');`);
+        await this.sleep(200);
         console.log('[Form] Middle Name filled + translated.');
       }
     } else {
@@ -426,8 +974,8 @@ export class GdrfaPortalPage {
     console.log(`[Form] Filling Last Name: "${passport.lastName}"...`);
     const lastFilled = await this.editAndFill('inpLastNameEn', passport.lastName);
     if (lastFilled) {
-      await this.page.evaluate(() => (window as any).translateInputText?.('inpLastNameEn'));
-      await this.page.waitForTimeout(200);
+      await this.driver.executeScript(`if (window.translateInputText) translateInputText('inpLastNameEn');`);
+      await this.sleep(200);
       console.log('[Form] Last Name filled + translated.');
     }
   }
@@ -436,26 +984,25 @@ export class GdrfaPortalPage {
 
   private async fillPassportDetails(passport: PassportDetails): Promise<void> {
     // Date of Birth
-    const dob = passport.dateOfBirth.replace(/\//g, '-');  // DD/MM/YYYY → DD-MM-YYYY
+    const dob = passport.dateOfBirth.replace(/\//g, '-');
     console.log(`[Form] Filling Date of Birth: "${dob}"...`);
-    // Check current value BEFORE clearing — skip if already correct
-    const currentDob = await this.page.evaluate(() => {
-      const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpDateOfBirth"]');
-      return el?.value?.trim() ?? '';
-    });
+    const currentDob = await this.driver.executeScript<string>(`
+      var el = document.querySelector('input[data-staticid="inpDateOfBirth"]');
+      return el ? (el.value || '').trim() : '';
+    `);
     if (currentDob && currentDob.toUpperCase() === dob.toUpperCase()) {
       console.log(`[Skip] Date of Birth already has correct value: "${currentDob}".`);
     } else {
-      await this.page.evaluate(() => {
-        const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpDateOfBirth"]');
+      await this.driver.executeScript(`
+        var el = document.querySelector('input[data-staticid="inpDateOfBirth"]');
         if (el) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }
-      });
+      `);
       await this.editAndFill('inpDateOfBirth', dob);
-      await this.page.evaluate(() => {
-        const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpDateOfBirth"]');
+      await this.driver.executeScript(`
+        var el = document.querySelector('input[data-staticid="inpDateOfBirth"]');
         if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
-      });
-      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      `);
+      await this.waitForPageLoad();
       console.log('[Form] Date of Birth filled.');
     }
 
@@ -465,21 +1012,21 @@ export class GdrfaPortalPage {
     if (bcResult.skipped) {
       console.log(`[Skip] Birth Country already set: "${bcResult.matched}".`);
     } else if (bcResult.found) {
-      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      await this.waitForPageLoad();
       console.log(`[Form] Birth Country set: "${bcResult.matched}".`);
     } else {
       console.warn(`[Form] Birth Country not found for: "${birthCountry}".`);
     }
 
-    // Birth Place EN: if the JSON holds a raw 3-letter MRZ code, convert it to a country name.
+    // Birth Place EN
     const birthPlace = /^[A-Z]{3}$/.test(passport.birthPlaceEN.trim())
       ? GdrfaPortalPage.mrzCodeToCountryName(passport.birthPlaceEN.trim())
       : passport.birthPlaceEN;
     console.log(`[Form] Filling Birth Place EN: "${birthPlace}"...`);
     const bpFilled = await this.editAndFill('inpApplicantBirthPlaceEn', birthPlace);
     if (bpFilled) {
-      await this.page.evaluate(() => (window as any).translateInputText('inpApplicantBirthPlaceEn'));
-      await this.page.waitForTimeout(200);
+      await this.driver.executeScript(`if (window.translateInputText) translateInputText('inpApplicantBirthPlaceEn');`);
+      await this.sleep(200);
       console.log('[Form] Birth Place EN filled + translated.');
     }
 
@@ -511,23 +1058,23 @@ export class GdrfaPortalPage {
     if (passport.passportIssueDate) {
       const issueDate = passport.passportIssueDate.replace(/\//g, '-');
       console.log(`[Form] Filling Passport Issue Date: "${issueDate}"...`);
-      const currentIssue = await this.page.evaluate(() => {
-        const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpPassportIssueDate"]');
-        return el?.value?.trim() ?? '';
-      });
+      const currentIssue = await this.driver.executeScript<string>(`
+        var el = document.querySelector('input[data-staticid="inpPassportIssueDate"]');
+        return el ? (el.value || '').trim() : '';
+      `);
       if (currentIssue && currentIssue.toUpperCase() === issueDate.toUpperCase()) {
         console.log(`[Skip] Passport Issue Date already has correct value: "${currentIssue}".`);
       } else {
-        await this.page.evaluate(() => {
-          const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpPassportIssueDate"]');
+        await this.driver.executeScript(`
+          var el = document.querySelector('input[data-staticid="inpPassportIssueDate"]');
           if (el) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }
-        });
+        `);
         await this.editAndFill('inpPassportIssueDate', issueDate);
-        await this.page.evaluate(() => {
-          const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpPassportIssueDate"]');
+        await this.driver.executeScript(`
+          var el = document.querySelector('input[data-staticid="inpPassportIssueDate"]');
           if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
-        });
-        await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+        `);
+        await this.waitForPageLoad();
         console.log('[Form] Passport Issue Date filled.');
       }
     } else {
@@ -536,23 +1083,23 @@ export class GdrfaPortalPage {
 
     const expiryDate = passport.passportExpiryDate.replace(/\//g, '-');
     console.log(`[Form] Filling Passport Expiry Date: "${expiryDate}"...`);
-    const currentExpiry = await this.page.evaluate(() => {
-      const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpPassportExpiryDate"]');
-      return el?.value?.trim() ?? '';
-    });
+    const currentExpiry = await this.driver.executeScript<string>(`
+      var el = document.querySelector('input[data-staticid="inpPassportExpiryDate"]');
+      return el ? (el.value || '').trim() : '';
+    `);
     if (currentExpiry && currentExpiry.toUpperCase() === expiryDate.toUpperCase()) {
       console.log(`[Skip] Passport Expiry Date already has correct value: "${currentExpiry}".`);
     } else {
-      await this.page.evaluate(() => {
-        const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpPassportExpiryDate"]');
+      await this.driver.executeScript(`
+        var el = document.querySelector('input[data-staticid="inpPassportExpiryDate"]');
         if (el) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }
-      });
+      `);
       await this.editAndFill('inpPassportExpiryDate', expiryDate);
-      await this.page.evaluate(() => {
-        const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpPassportExpiryDate"]');
+      await this.driver.executeScript(`
+        var el = document.querySelector('input[data-staticid="inpPassportExpiryDate"]');
         if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
-      });
-      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      `);
+      await this.waitForPageLoad();
       console.log('[Form] Passport Expiry Date filled.');
     }
 
@@ -563,8 +1110,8 @@ export class GdrfaPortalPage {
       console.log(`[Form] Filling Place of Issue EN: "${placeOfIssue}"...`);
       const poiFilled = await this.editAndFill('inpPassportPlaceIssueEn', placeOfIssue);
       if (poiFilled) {
-        await this.page.evaluate(() => (window as any).translateInputText?.('inpPassportPlaceIssueEn'));
-        await this.page.waitForTimeout(200);
+        await this.driver.executeScript(`if (window.translateInputText) translateInputText('inpPassportPlaceIssueEn');`);
+        await this.sleep(200);
         console.log('[Form] Place of Issue EN filled + translated.');
       }
     } else {
@@ -574,29 +1121,29 @@ export class GdrfaPortalPage {
 
   // ── Applicant detail fields ────────────────────────────────────────────────
 
-  private async fillApplicantDetails(applicant: ApplicantDetails): Promise<void> {
-    // Is Inside UAE checkbox — only interact if applicant IS inside (default is unchecked)
+  private async fillApplicantDetails(applicant: ApplicantDetails, passportIssueCountry?: string): Promise<void> {
+    // Is Inside UAE checkbox
     if (applicant.isInsideUAE) {
       console.log('[Form] Checking Is Inside UAE...');
-      await this.page.evaluate(() => {
-        const cb = document.querySelector<HTMLInputElement>('input[data-staticid="chkIsInsideUAE"]');
+      await this.driver.executeScript(`
+        var cb = document.querySelector('input[data-staticid="chkIsInsideUAE"]');
         if (cb && !cb.checked) {
           cb.classList.remove('ReadOnly');
           cb.checked = true;
           cb.dispatchEvent(new MouseEvent('click', { bubbles: true }));
         }
-      });
-      await this.page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      `);
+      await this.waitForPageLoad();
       console.log('[Form] Is Inside UAE checked.');
     }
 
-    // Mother Name EN (+ auto-translate to Arabic)
+    // Mother Name EN
     if (applicant.motherNameEN) {
       console.log(`[Form] Filling Mother Name EN: "${applicant.motherNameEN}"...`);
       const motherFilled = await this.editAndFill('inpMotherNameEn', applicant.motherNameEN);
       if (motherFilled) {
-        await this.page.evaluate(() => (window as any).translateInputText?.('inpMotherNameEn'));
-        await this.page.waitForTimeout(200);
+        await this.driver.executeScript(`if (window.translateInputText) translateInputText('inpMotherNameEn');`);
+        await this.sleep(200);
         console.log('[Form] Mother Name EN filled + translated.');
       }
     } else {
@@ -616,81 +1163,49 @@ export class GdrfaPortalPage {
       }
     }
 
-    // Religion (AJAX onChange repopulates Faith dropdown)
-    if (applicant.religion) {
-      console.log(`[Form] Setting Religion: "${applicant.religion}"...`);
-      const rResult = await this.selectByLabel('Religion', applicant.religion);
+    // Religion — always set to "Unknown"
+    {
+      const religionValue = 'Unknown';
+      console.log(`[Form] Setting Religion: "${religionValue}"...`);
+      const rResult = await this.selectByLabel('Religion', religionValue);
       if (rResult.skipped) {
         console.log(`[Skip] Religion already set: "${rResult.matched}".`);
       } else if (rResult.found) {
-        await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+        await this.waitForPageLoad();
         console.log(`[Form] Religion set: "${rResult.matched}".`);
       } else {
-        console.warn(`[Form] Religion not found for: "${applicant.religion}".`);
+        console.warn(`[Form] Religion not found for: "${religionValue}".`);
       }
     }
 
-    // Faith (options depend on Religion — must be set after Religion AJAX resolves)
-    if (applicant.faith) {
-      console.log(`[Form] Setting Faith: "${applicant.faith}"...`);
+    // Faith — always set to "Unknown"
+    {
+      const faithValue = 'Unknown';
+      console.log(`[Form] Setting Faith: "${faithValue}"...`);
 
-      // Check if Faith already has correct value — skip the entire Select2 interaction
-      const currentFaith = await this.page.evaluate(() => {
-        const sel = document.querySelector<HTMLSelectElement>('select[data-staticid="cmbApplicantFaith"]');
+      const currentFaith = await this.driver.executeScript<string>(`
+        var sel = document.querySelector('select[data-staticid="cmbApplicantFaith"]');
         if (!sel) return '';
-        return sel.options[sel.selectedIndex]?.text?.trim() ?? '';
-      });
+        return sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].text.trim() : '';
+      `);
       if (currentFaith && !currentFaith.includes('Select') &&
-          currentFaith.toUpperCase().includes(applicant.faith.toUpperCase())) {
+          currentFaith.toUpperCase().includes(faithValue.toUpperCase())) {
         console.log(`[Skip] Faith already set: "${currentFaith}".`);
       } else {
-        // Wait until the Faith dropdown has been populated (more than just "-- Select --")
-        await this.page.waitForFunction(() => {
-          const sel = document.querySelector<HTMLSelectElement>('select[data-staticid="cmbApplicantFaith"]');
-          return sel ? sel.options.length > 1 : false;
-        }, { timeout: 10000 }).catch(() => console.warn('[Form] Faith dropdown did not populate in time.'));
+        // Wait until the Faith dropdown has been populated
+        await this.waitForCondition(async () => {
+          return this.driver.executeScript<boolean>(`
+            var sel = document.querySelector('select[data-staticid="cmbApplicantFaith"]');
+            return sel ? sel.options.length > 1 : false;
+          `);
+        }, 10000).catch(() => console.warn('[Form] Faith dropdown did not populate in time.'));
 
-        // Remove ReadOnly from the Select2 container (preceding sibling of the native <select>)
-        await this.page.evaluate(() => {
-          const sel = document.querySelector('select[data-staticid="cmbApplicantFaith"]');
-          if (!sel) return;
-          const container = sel.previousElementSibling;
-          if (container?.classList.contains('select2-container')) {
-            container.classList.remove('ReadOnly');
-            container.querySelectorAll('.ReadOnly').forEach(el => el.classList.remove('ReadOnly'));
-          }
-        });
-
-        // Click the Select2 choice link to open the dropdown
-        const faithContainer = this.page.locator('[data-staticid="cmbApplicantFaith"]')
-          .locator('xpath=preceding-sibling::div[contains(@class,"select2-container")]');
-        await faithContainer.locator('.select2-choice').click({ timeout: 5000 });
-
-        // Remove ReadOnly from the drop panel (separate element appended to <body>)
-        await this.page.evaluate(() => {
-          const drop = document.querySelector('.select2-drop-active');
-          if (drop) {
-            drop.classList.remove('ReadOnly');
-            drop.querySelectorAll('.ReadOnly').forEach(el => el.classList.remove('ReadOnly'));
-          }
-        });
-
-        // Click the matching option from the results
-        const faithOption = this.page.locator('.select2-drop-active .select2-results li').filter({ hasText: applicant.faith }).first();
-        if (await faithOption.isVisible({ timeout: 5000 }).catch(() => false)) {
-          const matchedText = await faithOption.textContent() ?? '';
-          await faithOption.click();
-          await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-          console.log(`[Form] Faith set: "${matchedText.trim()}".`);
+        // Try programmatic selection first (most reliable)
+        const fResult = await this.selectByStaticId('cmbApplicantFaith', faithValue);
+        if (fResult.found) {
+          console.log(`[Form] Faith set: "${fResult.matched}".`);
         } else {
-          // Fallback: set value programmatically
-          console.warn(`[Form] Faith UI click failed — trying programmatic fallback...`);
-          const fResult = await this.selectByStaticId('cmbApplicantFaith', applicant.faith);
-          if (fResult.found) {
-            console.log(`[Form] Faith set (programmatic): "${fResult.matched}".`);
-          } else {
-            console.warn(`[Form] Faith not found for: "${applicant.faith}".`);
-          }
+          console.warn(`[Form] Faith not found for: "${faithValue}".`);
         }
       }
     }
@@ -708,64 +1223,72 @@ export class GdrfaPortalPage {
       }
     }
 
-    // Profession (autocomplete widget — type "SALES" and select "SALES EXECUTIVE")
+    // Profession
     {
-      // Check if profession is already filled (hidden input stores the selected value)
-      const currentProf = await this.page.evaluate(() => {
-        const hidden = document.querySelector<HTMLInputElement>('input[id*="wtProfession"][type="hidden"]');
-        return hidden?.value?.trim() ?? '';
-      });
+      const currentProf = await this.driver.executeScript<string>(`
+        var hidden = document.querySelector('input[id*="wtProfession"][type="hidden"]');
+        return hidden ? (hidden.value || '').trim() : '';
+      `);
       if (currentProf) {
         console.log(`[Skip] Profession already set (value: "${currentProf}").`);
       } else {
-      console.log('[Form] Filling Profession: typing "SALES" → selecting "SALES EXECUTIVE"...');
-      const profInput = this.page
-        .locator('input[id*="wtProfessionSerch"]')
-        .first();
-      if (await profInput.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await profInput.click();
-        await profInput.clear();
-        await this.page.keyboard.type('SALES', { delay: 40 });
+        console.log('[Form] Filling Profession: typing "SALES" → selecting "SALES EXECUTIVE"...');
+        try {
+          const profInput = await this.driver.findElement(By.css('input[id*="wtProfessionSerch"]'));
+          if (await profInput.isDisplayed().catch(() => false)) {
+            await profInput.click();
+            await profInput.clear();
 
-        // Wait for the autocomplete dropdown
-        const suggestionList = this.page.locator('ul.os-internal-ui-autocomplete li.os-internal-ui-menu-item');
-        await suggestionList.first().waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
+            // Type character by character
+            for (const char of 'SALES') {
+              await profInput.sendKeys(char);
+              await this.sleep(40);
+            }
 
-        // Find and click "SALES EXECUTIVE"
-        const allSuggestions = await suggestionList.all();
-        let matched = false;
-        for (const suggestion of allSuggestions) {
-          const text = ((await suggestion.textContent()) ?? '').trim().toUpperCase();
-          if (text === 'SALES EXECUTIVE') {
-            await suggestion.click();
-            console.log('[Form] Profession selected: "SALES EXECUTIVE".');
-            matched = true;
-            break;
+            // Wait for autocomplete dropdown
+            await this.sleep(1000);
+            const matched = await this.driver.executeScript<boolean>(`
+              var items = document.querySelectorAll('ul.os-internal-ui-autocomplete li.os-internal-ui-menu-item');
+              for (var i = 0; i < items.length; i++) {
+                if (items[i].textContent.trim().toUpperCase() === 'SALES EXECUTIVE') {
+                  items[i].click();
+                  return true;
+                }
+              }
+              if (items.length > 0) { items[0].click(); return true; }
+              return false;
+            `);
+            if (matched) {
+              console.log('[Form] Profession selected.');
+            } else {
+              console.warn('[Form] Profession autocomplete suggestions not found.');
+            }
+          } else {
+            console.warn('[Form] Profession input not found.');
           }
+        } catch {
+          console.warn('[Form] Profession input not found.');
         }
-        if (!matched) {
-          console.warn('[Form] "SALES EXECUTIVE" not found in suggestions — selecting first match.');
-          if (allSuggestions.length > 0 && await allSuggestions[0].isVisible().catch(() => false)) {
-            const fallbackText = (await allSuggestions[0].textContent())?.trim() ?? '';
-            await allSuggestions[0].click();
-            console.log(`[Form] Profession fallback selected: "${fallbackText}".`);
-          }
-        }
-      } else {
-        console.warn('[Form] Profession input not found.');
       }
-      } // end else (profession not yet set)
     }
 
-    // Coming From Country (AJAX Select2 — options loaded on search)
-    if (applicant.comingFromCountry) {
-      const cfcName = GdrfaPortalPage.mrzCodeToCountryName(applicant.comingFromCountry);
+    // Coming From Country (AJAX Select2) — fallback to Passport Issue Country
+    const comingFrom = applicant.comingFromCountry || passportIssueCountry || '';
+    if (comingFrom) {
+      const cfcName = GdrfaPortalPage.mrzCodeToCountryName(comingFrom);
       console.log(`[Form] Setting Coming From Country: "${cfcName}"...`);
       const cfcResult = await this.selectByAjaxSelect2('ComingFromCountry', cfcName);
       if (cfcResult) {
         console.log(`[Form] Coming From Country set: "${cfcResult}".`);
       } else {
-        console.warn(`[Form] Coming From Country not found for: "${cfcName}".`);
+        // Fallback: try selectByLabel
+        console.warn(`[Form] AJAX Select2 failed — trying label-based fallback...`);
+        const lblResult = await this.selectByLabel('Coming From Country', cfcName);
+        if (lblResult.found) {
+          console.log(`[Form] Coming From Country set (label): "${lblResult.matched}".`);
+        } else {
+          console.warn(`[Form] Coming From Country not found for: "${cfcName}".`);
+        }
       }
     } else {
       console.log('[Form] Coming From Country — skipped (empty).');
@@ -775,25 +1298,21 @@ export class GdrfaPortalPage {
   // ── Contact detail fields ─────────────────────────────────────────────────
 
   private async fillContactDetails(contact: ContactDetails): Promise<void> {
-    // Email
     if (contact.email) {
       console.log(`[Form] Filling Email: "${contact.email}"...`);
       await this.editAndFill('inpEmail', contact.email);
     }
 
-    // Mobile Number
     if (contact.mobileNumber) {
       console.log(`[Form] Filling Mobile Number: "${contact.mobileNumber}"...`);
       await this.editAndFill('inpMobileNumber', contact.mobileNumber);
     }
 
-    // Approval Email Copy (optional)
     if (contact.approvalEmailCopy) {
       console.log(`[Form] Filling Approval Email Copy: "${contact.approvalEmailCopy}"...`);
       await this.editAndFill('inpApprovalEmailCopy', contact.approvalEmailCopy);
     }
 
-    // Preferred SMS Language
     if (contact.preferredSMSLanguage) {
       console.log(`[Form] Setting Preferred SMS Language: "${contact.preferredSMSLanguage}"...`);
       const langResult = await this.selectByLabel('Preferred SMS Language', contact.preferredSMSLanguage);
@@ -807,48 +1326,47 @@ export class GdrfaPortalPage {
     }
 
     // ── Address Inside UAE ──────────────────────────────────────────────────
-    // Use data-staticid selectors (not label text) to avoid matching
-    // identically-named labels in the Host/Submitter section.
 
-    // Emirate (AJAX onChange populates City)
     if (contact.uaeEmirate) {
       console.log(`[Form] Setting Emirate: "${contact.uaeEmirate}"...`);
       const emResult = await this.selectByStaticId('cmbAddressInsideEmiratesId', contact.uaeEmirate);
       if (emResult.skipped) {
         console.log(`[Skip] Emirate already set: "${emResult.matched}".`);
       } else if (emResult.found) {
-        await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+        await this.waitForPageLoad();
         console.log(`[Form] Emirate set: "${emResult.matched}".`);
       } else {
         console.warn(`[Form] Emirate not found for: "${contact.uaeEmirate}".`);
       }
     }
 
-    // City (populated after Emirate AJAX — wait for options)
     if (contact.uaeCity) {
       console.log(`[Form] Setting City: "${contact.uaeCity}"...`);
-      await this.page.waitForFunction(() => {
-        const sel = document.querySelector<HTMLSelectElement>('select[data-staticid="cmbAddressInsideCityId"]');
-        return sel ? sel.options.length > 1 : false;
-      }, { timeout: 10000 }).catch(() => console.warn('[Form] City dropdown did not populate in time.'));
+      await this.waitForCondition(async () => {
+        return this.driver.executeScript<boolean>(`
+          var sel = document.querySelector('select[data-staticid="cmbAddressInsideCityId"]');
+          return sel ? sel.options.length > 1 : false;
+        `);
+      }, 10000).catch(() => console.warn('[Form] City dropdown did not populate in time.'));
       const cityResult = await this.selectByStaticId('cmbAddressInsideCityId', contact.uaeCity);
       if (cityResult.skipped) {
         console.log(`[Skip] City already set: "${cityResult.matched}".`);
       } else if (cityResult.found) {
-        await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+        await this.waitForPageLoad();
         console.log(`[Form] City set: "${cityResult.matched}".`);
       } else {
         console.warn(`[Form] City not found for: "${contact.uaeCity}".`);
       }
     }
 
-    // Area (populated after City AJAX — wait for options)
     if (contact.uaeArea) {
       console.log(`[Form] Setting Area: "${contact.uaeArea}"...`);
-      await this.page.waitForFunction(() => {
-        const sel = document.querySelector<HTMLSelectElement>('select[data-staticid="cmbAddressInsideAreaId"]');
-        return sel ? sel.options.length > 1 : false;
-      }, { timeout: 10000 }).catch(() => console.warn('[Form] Area dropdown did not populate in time.'));
+      await this.waitForCondition(async () => {
+        return this.driver.executeScript<boolean>(`
+          var sel = document.querySelector('select[data-staticid="cmbAddressInsideAreaId"]');
+          return sel ? sel.options.length > 1 : false;
+        `);
+      }, 10000).catch(() => console.warn('[Form] Area dropdown did not populate in time.'));
       const areaResult = await this.selectByStaticId('cmbAddressInsideAreaId', contact.uaeArea);
       if (areaResult.skipped) {
         console.log(`[Skip] Area already set: "${areaResult.matched}".`);
@@ -859,25 +1377,21 @@ export class GdrfaPortalPage {
       }
     }
 
-    // Street
     if (contact.uaeStreet) {
       console.log(`[Form] Filling Street: "${contact.uaeStreet}"...`);
       await this.editAndFill('inpAddressInsideStreet2', contact.uaeStreet);
     }
 
-    // Building/Villa
     if (contact.uaeBuilding) {
       console.log(`[Form] Filling Building/Villa: "${contact.uaeBuilding}"...`);
       await this.editAndFill('inpAddressInsideBuilding', contact.uaeBuilding);
     }
 
-    // Floor
     if (contact.uaeFloor) {
       console.log(`[Form] Filling Floor: "${contact.uaeFloor}"...`);
       await this.editAndFill('inpFloorNo', contact.uaeFloor);
     }
 
-    // Flat/Villa no.
     if (contact.uaeFlat) {
       console.log(`[Form] Filling Flat/Villa no.: "${contact.uaeFlat}"...`);
       await this.editAndFill('inpFlatNo', contact.uaeFlat);
@@ -885,7 +1399,6 @@ export class GdrfaPortalPage {
 
     // ── Address Outside UAE ─────────────────────────────────────────────────
 
-    // Country
     if (contact.outsideCountry) {
       const countryName = GdrfaPortalPage.mrzCodeToCountryName(contact.outsideCountry);
       console.log(`[Form] Setting Outside Country: "${countryName}"...`);
@@ -893,26 +1406,23 @@ export class GdrfaPortalPage {
       if (ocResult.skipped) {
         console.log(`[Skip] Outside Country already set: "${ocResult.matched}".`);
       } else if (ocResult.found) {
-        await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+        await this.waitForPageLoad();
         console.log(`[Form] Outside Country set: "${ocResult.matched}".`);
       } else {
         console.warn(`[Form] Outside Country not found for: "${countryName}".`);
       }
     }
 
-    // Mobile Number (outside UAE)
     if (contact.outsideMobile) {
       console.log(`[Form] Filling Outside Mobile: "${contact.outsideMobile}"...`);
       await this.editAndFill('inpAddressOutsideMobileNumber', contact.outsideMobile);
     }
 
-    // City (outside UAE)
     if (contact.outsideCity) {
       console.log(`[Form] Filling Outside City: "${contact.outsideCity}"...`);
       await this.editAndFill('inpAddressOutsideCity', contact.outsideCity);
     }
 
-    // Address (outside UAE)
     if (contact.outsideAddress) {
       console.log(`[Form] Filling Outside Address: "${contact.outsideAddress}"...`);
       await this.editAndFill('inpAddressOutsideAddress1', contact.outsideAddress);
@@ -922,11 +1432,10 @@ export class GdrfaPortalPage {
   // ── Retry Faith selection (before Continue) ────────────────────────────────
 
   private async retryFaithSelection(faith: string): Promise<void> {
-    // Check if Faith is still "-- Select --"
-    const needsRetry = await this.page.evaluate(() => {
-      const sel = document.querySelector<HTMLSelectElement>('select[data-staticid="cmbApplicantFaith"]');
-      return sel ? sel.value === '' || sel.options[sel.selectedIndex]?.text.includes('Select') : false;
-    });
+    const needsRetry = await this.driver.executeScript<boolean>(`
+      var sel = document.querySelector('select[data-staticid="cmbApplicantFaith"]');
+      return sel ? sel.value === '' || (sel.options[sel.selectedIndex] && sel.options[sel.selectedIndex].text.indexOf('Select') >= 0) : false;
+    `);
 
     if (!needsRetry) {
       console.log('[Form] Faith already set — no retry needed.');
@@ -936,45 +1445,60 @@ export class GdrfaPortalPage {
     console.log(`[Form] Faith still unset — retrying selection: "${faith}"...`);
 
     // Scroll to Faith area
-    await this.page.evaluate(() => {
-      const sel = document.querySelector('select[data-staticid="cmbApplicantFaith"]');
-      sel?.scrollIntoView({ block: 'center', behavior: 'instant' });
-    });
+    await this.driver.executeScript(`
+      var sel = document.querySelector('select[data-staticid="cmbApplicantFaith"]');
+      if (sel) sel.scrollIntoView({ block: 'center', behavior: 'instant' });
+    `);
 
     // Remove ReadOnly from the Select2 container
-    await this.page.evaluate(() => {
-      const sel = document.querySelector('select[data-staticid="cmbApplicantFaith"]');
+    await this.driver.executeScript(`
+      var sel = document.querySelector('select[data-staticid="cmbApplicantFaith"]');
       if (!sel) return;
-      const container = sel.previousElementSibling;
-      if (container?.classList.contains('select2-container')) {
+      var container = sel.previousElementSibling;
+      if (container && container.classList.contains('select2-container')) {
         container.classList.remove('ReadOnly');
-        container.querySelectorAll('.ReadOnly').forEach(el => el.classList.remove('ReadOnly'));
+        container.querySelectorAll('.ReadOnly').forEach(function(el) { el.classList.remove('ReadOnly'); });
       }
-    });
+    `);
 
     // Click Select2 choice to open dropdown
-    const faithContainer = this.page.locator('[data-staticid="cmbApplicantFaith"]')
-      .locator('xpath=preceding-sibling::div[contains(@class,"select2-container")]');
-    await faithContainer.locator('.select2-choice').click({ timeout: 5000 });
-    await this.page.waitForTimeout(100);
+    await this.driver.executeScript(`
+      var sel = document.querySelector('[data-staticid="cmbApplicantFaith"]');
+      if (!sel) return;
+      var prev = sel.previousElementSibling;
+      if (prev && prev.classList.contains('select2-container')) {
+        var choice = prev.querySelector('.select2-choice');
+        if (choice) choice.click();
+      }
+    `);
+    await this.sleep(100);
 
     // Remove ReadOnly from the drop panel
-    await this.page.evaluate(() => {
-      const drop = document.querySelector('.select2-drop-active');
+    await this.driver.executeScript(`
+      var drop = document.querySelector('.select2-drop-active');
       if (drop) {
         drop.classList.remove('ReadOnly');
-        drop.querySelectorAll('.ReadOnly').forEach(el => el.classList.remove('ReadOnly'));
+        drop.querySelectorAll('.ReadOnly').forEach(function(el) { el.classList.remove('ReadOnly'); });
       }
-    });
-    await this.page.waitForTimeout(100);
+    `);
+    await this.sleep(100);
 
     // Click the matching option
-    const faithOption = this.page.locator('.select2-drop-active .select2-results li').filter({ hasText: faith }).first();
-    if (await faithOption.isVisible({ timeout: 5000 }).catch(() => false)) {
-      const matchedText = await faithOption.textContent() ?? '';
-      await faithOption.click();
-      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-      console.log(`[Form] Faith retry set: "${matchedText.trim()}".`);
+    const matchedText = await this.driver.executeScript<string>(`
+      var faith = arguments[0];
+      var results = document.querySelectorAll('.select2-drop-active .select2-results li');
+      for (var i = 0; i < results.length; i++) {
+        if (results[i].textContent.toUpperCase().indexOf(faith.toUpperCase()) >= 0) {
+          results[i].click();
+          return results[i].textContent.trim();
+        }
+      }
+      return '';
+    `, faith);
+
+    if (matchedText) {
+      await this.waitForPageLoad();
+      console.log(`[Form] Faith retry set: "${matchedText}".`);
     } else {
       // Last resort: programmatic
       const fResult = await this.selectByStaticId('cmbApplicantFaith', faith);
@@ -988,10 +1512,6 @@ export class GdrfaPortalPage {
 
   // ── Pre-Continue validation ────────────────────────────────────────────────
 
-  /**
-   * Checks all required fields on the form. If any are empty or still "-- Select --",
-   * retries filling them from the application data. Runs up to 2 retry passes.
-   */
   private async validateAndRetryRequiredFields(app: VisaApplication): Promise<void> {
     const MAX_RETRIES = 2;
 
@@ -1018,7 +1538,7 @@ export class GdrfaPortalPage {
       }
     }
 
-    // Final check — log remaining empty fields but don't block
+    // Final check
     const remaining = await this.getEmptyRequiredFields(app);
     if (remaining.length > 0) {
       console.warn(`[Validate] WARNING: ${remaining.length} field(s) still empty after retries: ${remaining.map(f => f.name).join(', ')}`);
@@ -1027,51 +1547,44 @@ export class GdrfaPortalPage {
     }
   }
 
-  /**
-   * Reads the current state of all required form fields and returns
-   * the ones that are empty/unset, along with a retry function for each.
-   */
   private async getEmptyRequiredFields(
     app: VisaApplication,
   ): Promise<Array<{ name: string; retry: () => Promise<unknown> }>> {
     const empty: Array<{ name: string; retry: () => Promise<unknown> }> = [];
 
-    // Helper: check if a text input (by data-staticid) has a value
     const inputHasValue = async (staticId: string): Promise<boolean> => {
-      const val = await this.page.evaluate((id: string) => {
-        const el = document.querySelector<HTMLInputElement>(`input[data-staticid="${id}"]`);
-        return el?.value?.trim() ?? '';
-      }, staticId);
+      const val = await this.driver.executeScript<string>(`
+        var el = document.querySelector('input[data-staticid="' + arguments[0] + '"]');
+        return el ? (el.value || '').trim() : '';
+      `, staticId);
       return val.length > 0;
     };
 
-    // Helper: check if a <select> (by data-staticid) has a real selection (not "-- Select --" or empty)
     const selectHasValue = async (staticId: string): Promise<boolean> => {
-      const val = await this.page.evaluate((id: string) => {
-        const sel = document.querySelector<HTMLSelectElement>(`select[data-staticid="${id}"]`);
+      const val = await this.driver.executeScript<string>(`
+        var sel = document.querySelector('select[data-staticid="' + arguments[0] + '"]');
         if (!sel) return '';
-        const text = sel.options[sel.selectedIndex]?.text?.trim() ?? '';
-        return text;
-      }, staticId);
+        return sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].text.trim() : '';
+      `, staticId);
       return val.length > 0 && !val.includes('Select');
     };
 
-    // Helper: check if a select by label has a real selection
     const selectByLabelHasValue = async (labelText: string): Promise<boolean> => {
-      const val = await this.page.evaluate((label: string) => {
-        const labels = Array.from(document.querySelectorAll('label'));
-        const lbl = labels.find(l => l.textContent?.trim() === label);
+      const val = await this.driver.executeScript<string>(`
+        var label = arguments[0];
+        var labels = Array.from(document.querySelectorAll('label'));
+        var lbl = labels.find(function(l) { return l.textContent && l.textContent.trim() === label; });
         if (!lbl) return '';
-        const forId = lbl.getAttribute('for') || lbl.id?.replace(/lbl/i, '');
-        const sel = document.querySelector<HTMLSelectElement>(`select[id*="${forId}"]`)
-          || lbl.closest('.ThemeGrid_Width6')?.parentElement?.querySelector('select');
+        var forId = lbl.getAttribute('for') || (lbl.id ? lbl.id.replace(/lbl/i, '') : '');
+        var sel = document.querySelector('select[id*="' + forId + '"]')
+          || (lbl.closest('.ThemeGrid_Width6') ? lbl.closest('.ThemeGrid_Width6').parentElement.querySelector('select') : null);
         if (!sel) return '';
-        return sel.options[sel.selectedIndex]?.text?.trim() ?? '';
-      }, labelText);
+        return sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].text.trim() : '';
+      `, labelText);
       return val.length > 0 && !val.includes('Select');
     };
 
-    // ── Passport Names ────────────────────────────────────────────────────
+    // Passport Names
     if (app.passport.firstName && !await inputHasValue('inpFirsttNameEn')) {
       empty.push({ name: 'First Name', retry: () => this.editAndFill('inpFirsttNameEn', app.passport.firstName) });
     }
@@ -1079,7 +1592,7 @@ export class GdrfaPortalPage {
       empty.push({ name: 'Last Name', retry: () => this.editAndFill('inpLastNameEn', app.passport.lastName) });
     }
 
-    // ── Passport Details ──────────────────────────────────────────────────
+    // Passport Details
     if (app.passport.dateOfBirth && !await inputHasValue('inpDateOfBirth')) {
       empty.push({ name: 'Date of Birth', retry: () => this.editAndFill('inpDateOfBirth', app.passport.dateOfBirth) });
     }
@@ -1099,7 +1612,7 @@ export class GdrfaPortalPage {
       empty.push({ name: 'Passport Place of Issue', retry: () => this.editAndFill('inpPassportPlaceIssueEn', poi) });
     }
 
-    // ── Passport Selects ──────────────────────────────────────────────────
+    // Passport Selects
     if (app.passport.gender && !await selectByLabelHasValue('Gender')) {
       empty.push({ name: 'Gender', retry: async () => { await this.selectByLabel('Gender', app.passport.gender); } });
     }
@@ -1110,7 +1623,7 @@ export class GdrfaPortalPage {
       empty.push({ name: 'Passport Issue Country', retry: async () => { await this.selectByLabel('Passport Issue Country', app.passport.passportIssueCountry); } });
     }
 
-    // ── Applicant Details ─────────────────────────────────────────────────
+    // Applicant Details
     if (app.applicant.motherNameEN && !await inputHasValue('inpMotherNameEn')) {
       empty.push({ name: 'Mother Name', retry: () => this.editAndFill('inpMotherNameEn', app.applicant.motherNameEN) });
     }
@@ -1127,7 +1640,7 @@ export class GdrfaPortalPage {
       empty.push({ name: 'Faith', retry: () => this.retryFaithSelection(app.applicant.faith!) });
     }
 
-    // ── Contact Details ───────────────────────────────────────────────────
+    // Contact Details
     if (app.contact.email && !await inputHasValue('inpEmail')) {
       empty.push({ name: 'Email', retry: () => this.editAndFill('inpEmail', app.contact.email) });
     }
@@ -1171,18 +1684,15 @@ export class GdrfaPortalPage {
 
   // ── Continue button ────────────────────────────────────────────────────────
 
-  /**
-   * Waits for the OutSystems Feedback_AjaxWait loader to disappear.
-   * The portal shows this spinner during AJAX operations and page transitions.
-   */
   private async waitForLoaderToDisappear(): Promise<void> {
-    const loader = this.page.locator('div.Feedback_AjaxWait:visible');
     try {
-      // If a loader is currently visible, wait for it to hide
-      if (await loader.isVisible().catch(() => false)) {
-        console.log('[Loader] Waiting for loader to disappear...');
-        await loader.waitFor({ state: 'hidden', timeout: 30000 });
-        console.log('[Loader] Loader gone.');
+      const loaders = await this.driver.findElements(By.css('div.Feedback_AjaxWait'));
+      for (const loader of loaders) {
+        if (await loader.isDisplayed().catch(() => false)) {
+          console.log('[Loader] Waiting for loader to disappear...');
+          await this.driver.wait(until.stalenessOf(loader), 30000).catch(() => {});
+          console.log('[Loader] Loader gone.');
+        }
       }
     } catch {
       // Loader may have already disappeared
@@ -1191,411 +1701,529 @@ export class GdrfaPortalPage {
 
   private async clickContinue(): Promise<void> {
     console.log('[Form] Clicking Continue...');
-    const btn = this.page.locator('input[staticid="SmartChannels_EntryPermitNewTourism_btnContinue"]');
-    await btn.scrollIntoViewIfNeeded();
-    await btn.click({ timeout: 10000 });
+    const btn = await this.driver.findElement(By.css('input[staticid="SmartChannels_EntryPermitNewTourism_btnContinue"]'));
+    await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', btn);
+    await btn.click();
     console.log('[Form] Continue clicked — waiting for popup or next page...');
 
-    // After clicking, the portal loads ExistingApplicationConfirmation_PopUp.aspx
-    // inside an IFRAME (URL stays on EntryPermitTourism.aspx).
-    // Wait for an iframe containing the popup to appear.
     const popupFrame = await this.findPopupFrame(30000);
 
     if (popupFrame) {
       console.log('[Form] Existing application popup detected (in iframe).');
-      await this.handleExistingApplicationPopup(popupFrame);
+      await this.handleExistingApplicationPopup();
     } else {
-      // No popup — might have gone directly to next page
       console.log('[Form] No popup — proceeding...');
     }
-
   }
 
-
-  /**
-   * Searches all frames on the page for the popup container.
-   * The popup loads inside an iframe as ExistingApplicationConfirmation_PopUp.aspx.
-   * Returns the Frame if found, or null if not found within timeout.
-   */
-  private async findPopupFrame(timeout: number): Promise<import('@playwright/test').Frame | null> {
+  private async findPopupFrame(timeout: number): Promise<boolean> {
     const deadline = Date.now() + timeout;
 
     while (Date.now() < deadline) {
-      // Check all frames (main + child iframes)
-      for (const frame of this.page.frames()) {
+      // Check all iframes for the popup
+      const iframes = await this.driver.findElements(By.css('iframe'));
+      for (const iframe of iframes) {
         try {
-          // Look for the popup's distinctive element inside each frame
-          const el = await frame.$('div.MainPopup');
-          if (el) {
-            console.log(`[Form] Found popup in frame: ${frame.url()}`);
-            return frame;
+          await this.driver.switchTo().frame(iframe);
+          const popups = await this.driver.findElements(By.css('div.MainPopup'));
+          if (popups.length > 0) {
+            const frameUrl = await this.driver.getCurrentUrl();
+            console.log(`[Form] Found popup in frame: ${frameUrl}`);
+            await this.driver.switchTo().defaultContent();
+            return true;
           }
+          await this.driver.switchTo().defaultContent();
         } catch {
-          // Frame may be navigating, skip
+          try { await this.driver.switchTo().defaultContent(); } catch {}
         }
       }
-      await this.page.waitForTimeout(250);
+      await this.sleep(250);
     }
-    return null;
+    return false;
   }
 
-  /**
-   * Handles the "Existing Application Details" popup loaded inside an iframe.
-   * Extracts data, pauses for review, then clicks Continue inside the iframe.
-   */
-  private async handleExistingApplicationPopup(frame: import('@playwright/test').Frame): Promise<void> {
+  private async handleExistingApplicationPopup(): Promise<void> {
     console.log('[Form] On "Existing Application Details" popup!');
 
-    // ── Data extraction from the iframe ──────────────────────────────────────
-    const boldSpans = frame.locator('div.MainPopup span.Bold');
-    const count     = await boldSpans.count();
-    const values: string[] = [];
-    for (let i = 0; i < count; i++) {
-      const text = await boldSpans.nth(i).textContent() ?? '';
-      values.push(text.replace(/\u00a0/g, ' ').trim());
+    // Find the iframe with the popup and switch to it
+    const iframes = await this.driver.findElements(By.css('iframe'));
+    for (const iframe of iframes) {
+      try {
+        await this.driver.switchTo().frame(iframe);
+        const popups = await this.driver.findElements(By.css('div.MainPopup'));
+        if (popups.length > 0) break;
+        await this.driver.switchTo().defaultContent();
+      } catch {
+        try { await this.driver.switchTo().defaultContent(); } catch {}
+      }
     }
 
-    const popupData = {
-      applicationNumber: values[0] ?? '',
-      applicantName:     values[1] ?? '',
-      nationality:       values[2] ?? '',
-      passportNo:        values[3] ?? '',
-      sponsorName:       values[4] ?? '',
-      createdDate:       values[5] ?? '',
-    };
+    // Extract data
+    const values = await this.driver.executeScript<string[]>(`
+      var spans = document.querySelectorAll('div.MainPopup span.Bold');
+      var vals = [];
+      for (var i = 0; i < spans.length; i++) {
+        vals.push(spans[i].textContent.replace(/\\u00a0/g, ' ').trim());
+      }
+      return vals;
+    `);
 
     console.log('[Form] ── Existing Application Details ──');
-    console.log(`  Application Number : ${popupData.applicationNumber}`);
-    console.log(`  Applicant Name     : ${popupData.applicantName}`);
-    console.log(`  Nationality        : ${popupData.nationality}`);
-    console.log(`  Passport No        : ${popupData.passportNo}`);
-    console.log(`  Sponsor Name       : ${popupData.sponsorName}`);
-    console.log(`  Created Date       : ${popupData.createdDate}`);
+    console.log(`  Application Number : ${values[0] ?? ''}`);
+    console.log(`  Applicant Name     : ${values[1] ?? ''}`);
+    console.log(`  Nationality        : ${values[2] ?? ''}`);
+    console.log(`  Passport No        : ${values[3] ?? ''}`);
+    console.log(`  Sponsor Name       : ${values[4] ?? ''}`);
+    console.log(`  Created Date       : ${values[5] ?? ''}`);
     console.log('[Form] ────────────────────────────────────');
 
-    // ── Click Continue inside the iframe (once) ────────────────────────────────
-    const closeBtn = frame.locator('input[staticid="CommonTh_ExistingApplicationConfirmationPopUp_btnCancel"]');
-    const popupContinueBtn = closeBtn.locator('xpath=following-sibling::input[@value="Continue"]');
+    // Click Continue inside the iframe
+    try {
+      const closeBtn = await this.driver.findElement(
+        By.css('input[staticid="CommonTh_ExistingApplicationConfirmationPopUp_btnCancel"]')
+      );
+      // Find the Continue button (sibling of Cancel)
+      const continueBtn = await this.driver.executeScript<WebElement>(`
+        var cancel = arguments[0];
+        var sibling = cancel.nextElementSibling;
+        while (sibling) {
+          if (sibling.tagName === 'INPUT' && sibling.value === 'Continue') return sibling;
+          sibling = sibling.nextElementSibling;
+        }
+        return null;
+      `, closeBtn);
 
-    // Ensure button is ready before clicking
-    await popupContinueBtn.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {});
-    await popupContinueBtn.click({ force: true, timeout: 10000 });
-    console.log('[Form] Clicked Continue on popup.');
+      if (continueBtn) {
+        await continueBtn.click();
+        console.log('[Form] Clicked Continue on popup.');
+      }
+    } catch (e) {
+      console.warn('[Form] Could not click Continue on popup:', e);
+    }
 
-    // Wait for the popup iframe to close and page to settle
-    await this.page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+    // Switch back to main content
+    await this.driver.switchTo().defaultContent();
+
+    await this.waitForPageLoad();
     await this.waitForLoaderToDisappear();
     console.log('[Form] Popup dismissed.');
   }
 
   // ── SmartInput helpers ─────────────────────────────────────────────────────
 
-  /**
-   * Clicks the pencil icon to switch a SmartInput field from ReadOnly to edit mode,
-   * scrolls it into view first, then fills it.  Falls back to JS if the pencil fails.
-   */
-  /**
-   * Returns true if the field was actually filled, false if skipped (already has correct value).
-   */
   private async editAndFill(staticId: string, value: string): Promise<boolean> {
-    // Check if the field already has the correct value — skip if so
-    const currentVal = await this.page.evaluate((id: string) => {
-      const el = document.querySelector<HTMLInputElement>(`input[data-staticid="${id}"]`);
-      return el?.value?.trim() ?? '';
-    }, staticId);
+    // Check if the field already has the correct value
+    const currentVal = await this.driver.executeScript<string>(`
+      var el = document.querySelector('input[data-staticid="' + arguments[0] + '"]');
+      return el ? (el.value || '').trim() : '';
+    `, staticId);
     if (currentVal !== '' && currentVal.toUpperCase() === value.trim().toUpperCase()) {
       console.log(`[Skip] "${staticId}" already has correct value: "${currentVal}".`);
       return false;
     }
 
-    // Scroll the field into view first
-    await this.page.evaluate((id: string) => {
-      const input = document.querySelector<HTMLInputElement>(`input[data-staticid="${id}"]`);
-      if (input) input.scrollIntoView({ block: 'center', behavior: 'instant' });
-    }, staticId);
+    // Unlock the field: remove ReadOnly, click pencil, enable input — all via JS
+    await this.driver.executeScript(`
+      var id = arguments[0];
+      var input = document.querySelector('input[data-staticid="' + id + '"]');
+      if (!input) return;
+      input.scrollIntoView({ block: 'center', behavior: 'instant' });
 
-    // Use Playwright's native click on the pencil (sends real pointer events, more reliable
-    // than JS element.click()). XPath walks up to the nearest ancestor containing the pencil,
-    // then back down to the pencil element itself.
-    const pencil = this.page
-      .locator(`input[data-staticid="${staticId}"]`)
-      .locator('xpath=ancestor::*[.//*[contains(@class,"FormEditPencil")]][1]//*[contains(@class,"FormEditPencil")]')
-      .first();
+      // Remove ReadOnly from the input and all ancestors
+      input.classList.remove('ReadOnly');
+      input.removeAttribute('readonly');
+      input.removeAttribute('disabled');
+      var el = input.parentElement;
+      while (el && el !== document.body) {
+        el.classList.remove('ReadOnly');
+        var pencil = el.querySelector('.FormEditPencil');
+        if (pencil) { pencil.click(); break; }
+        el = el.parentElement;
+      }
+    `, staticId);
+    await this.sleep(300);
 
-    const pencilClicked = await pencil.click({ timeout: 3000 }).then(() => true).catch(() => false);
+    // Try Selenium sendKeys first (triggers proper key events)
+    let filled = false;
+    try {
+      const field = await this.driver.findElement(By.css(`input[data-staticid="${staticId}"]`));
+      const isVisible = await field.isDisplayed().catch(() => false);
+      const isReadonly = await field.getAttribute('readonly');
+      if (isVisible && !isReadonly) {
+        await field.clear();
+        await field.sendKeys(value);
+        filled = true;
+      }
+    } catch {}
 
-    if (!pencilClicked) {
-      // Fallback: JS DOM traversal click (in case XPath doesn't resolve)
-      await this.page.evaluate((id: string) => {
-        const input = document.querySelector<HTMLInputElement>(`input[data-staticid="${id}"]`);
-        if (!input) return;
-        let el: Element | null = input.parentElement;
-        while (el && el !== document.body) {
-          const p = el.querySelector<HTMLElement>('.FormEditPencil');
-          if (p) { p.click(); return; }
-          el = el.parentElement;
-        }
-      }, staticId);
-    }
-
-    const field = this.page.locator(`input[data-staticid="${staticId}"]`);
-    const visible = await field.waitFor({ state: 'visible', timeout: 8000 }).then(() => true).catch(() => false);
-
-    if (visible) {
-      await field.clear();
-      await field.fill(value);
-    } else {
-      console.warn(`[Form] Pencil mode failed for "${staticId}" — using JS value fallback.`);
-      await this.page.evaluate((args: { id: string; val: string }) => {
-        const el = document.querySelector<HTMLInputElement>(`input[data-staticid="${args.id}"]`);
+    if (!filled) {
+      // JS fallback with proper event dispatch
+      await this.driver.executeScript(`
+        var id = arguments[0];
+        var val = arguments[1];
+        var el = document.querySelector('input[data-staticid="' + id + '"]');
         if (!el) return;
         el.classList.remove('ReadOnly');
         el.removeAttribute('readonly');
-        el.value = '';
-        el.dispatchEvent(new Event('input',  { bubbles: true }));
-        el.value = args.val;
-        el.dispatchEvent(new Event('input',  { bubbles: true }));
+        el.removeAttribute('disabled');
+        // Clear first
+        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        nativeInputValueSetter.call(el, '');
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        // Set value using native setter (triggers React/framework change detection)
+        nativeInputValueSetter.call(el, val);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
-      }, { id: staticId, val: value });
+        el.dispatchEvent(new Event('blur', { bubbles: true }));
+      `, staticId, value);
     }
+    // Pause after each field to let the slow website process
+    await this.sleep(600);
     return true;
   }
 
-  /** Clears a ReadOnly Arabic SmartInput field via JS (CSS-hidden, no pencil available). */
   private async clearArField(staticId: string): Promise<void> {
-    await this.page.evaluate((id: string) => {
-      const el = document.querySelector<HTMLInputElement>(`input[data-staticid="${id}"]`);
+    await this.driver.executeScript(`
+      var el = document.querySelector('input[data-staticid="' + arguments[0] + '"]');
       if (el) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }
-    }, staticId);
+    `, staticId);
   }
 
-  /**
-   * Finds a native <select> by its visible label text and sets its value by
-   * searching option text.  More reliable than data-staticid because the
-   * label → htmlFor → <select> chain is always present regardless of staticid.
-   */
-  /**
-   * Returns { found, matched, skipped } — skipped=true means the dropdown already had the correct value.
-   */
   private async selectByLabel(
     labelText: string,
     searchValue: string
   ): Promise<{ found: boolean; matched: string; skipped?: boolean }> {
-    return this.page.evaluate(
-      ({ label, search }: { label: string; search: string }) => {
-        // Skip Select2's auto-generated offscreen labels
-        const lbl = Array.from(document.querySelectorAll<HTMLLabelElement>('label')).find(
-          l => !l.classList.contains('select2-offscreen') &&
-               l.textContent?.trim().toLowerCase() === label.toLowerCase()
-        );
-        if (!lbl || !lbl.htmlFor) return { found: false, matched: '' };
+    return this.driver.executeScript<{ found: boolean; matched: string; skipped?: boolean }>(`
+      var label = arguments[0];
+      var search = arguments[1];
+      var lbl = Array.from(document.querySelectorAll('label')).find(function(l) {
+        return !l.classList.contains('select2-offscreen') &&
+               l.textContent && l.textContent.trim().toLowerCase() === label.toLowerCase();
+      });
+      if (!lbl || !lbl.htmlFor) return { found: false, matched: '' };
 
-        const el  = document.getElementById(lbl.htmlFor);
-        const sel = el instanceof HTMLSelectElement
-          ? el
-          : el?.parentElement?.querySelector<HTMLSelectElement>('select') ?? null;
-        if (!sel) return { found: false, matched: '' };
+      var el = document.getElementById(lbl.htmlFor);
+      var sel = (el instanceof HTMLSelectElement) ? el
+        : (el && el.parentElement ? el.parentElement.querySelector('select') : null);
+      if (!sel) return { found: false, matched: '' };
 
-        // Check if already has the correct value — skip if so
-        const currentText = sel.options[sel.selectedIndex]?.text?.trim() ?? '';
-        if (currentText && !currentText.includes('Select') &&
-            (currentText.toUpperCase() === search.toUpperCase() ||
-             currentText.toUpperCase().includes(search.toUpperCase()))) {
-          return { found: true, matched: currentText, skipped: true };
-        }
+      var currentText = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].text.trim() : '';
+      if (currentText && currentText.indexOf('Select') < 0 &&
+          (currentText.toUpperCase() === search.toUpperCase() ||
+           currentText.toUpperCase().indexOf(search.toUpperCase()) >= 0)) {
+        return { found: true, matched: currentText, skipped: true };
+      }
 
-        // Unlock SmartInput ReadOnly — check ancestor, preceding sibling, next sibling, and by Select2 ID convention
-        const s2 = sel.closest<HTMLElement>('.select2-container')
-          ?? (sel.previousElementSibling?.classList.contains('select2-container') ? sel.previousElementSibling as HTMLElement : null)
-          ?? (sel.nextElementSibling?.classList.contains('select2-container') ? sel.nextElementSibling as HTMLElement : null)
-          ?? document.getElementById('s2id_' + sel.id) as HTMLElement | null;
-        if (s2) {
-          s2.classList.remove('ReadOnly');
-          s2.querySelectorAll('.ReadOnly').forEach(el => el.classList.remove('ReadOnly'));
-        }
-        sel.removeAttribute('disabled');
+      var s2 = sel.closest('.select2-container')
+        || (sel.previousElementSibling && sel.previousElementSibling.classList.contains('select2-container') ? sel.previousElementSibling : null)
+        || (sel.nextElementSibling && sel.nextElementSibling.classList.contains('select2-container') ? sel.nextElementSibling : null)
+        || document.getElementById('s2id_' + sel.id);
+      if (s2) {
+        s2.classList.remove('ReadOnly');
+        s2.querySelectorAll('.ReadOnly').forEach(function(el) { el.classList.remove('ReadOnly'); });
+      }
+      sel.removeAttribute('disabled');
 
-        const opts = Array.from(sel.options);
-        // Try exact match first to avoid substring false positives (e.g. "Male" inside "Female")
-        const match =
-          opts.find(o => o.text.trim().toUpperCase() === search.toUpperCase()) ??
-          opts.find(o => o.text.toUpperCase().includes(search.toUpperCase()));
-        if (!match) return { found: false, matched: '' };
+      var opts = Array.from(sel.options);
+      var match = opts.find(function(o) { return o.text.trim().toUpperCase() === search.toUpperCase(); })
+        || opts.find(function(o) { return o.text.toUpperCase().indexOf(search.toUpperCase()) >= 0; });
+      if (!match) return { found: false, matched: '' };
 
-        sel.value = '';
-        sel.value = match.value;
-        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      sel.value = '';
+      sel.value = match.value;
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
 
-        // Also trigger jQuery change + update Select2 display text
-        const $ = (window as any).jQuery || (window as any).$;
-        if ($) {
-          $(sel).val(match.value).trigger('change');
-        }
-        if (s2) {
-          const chosen = s2.querySelector('.select2-chosen');
-          if (chosen) chosen.textContent = match.text.trim();
-        }
+      var jq = window.jQuery || window.$;
+      if (jq) { jq(sel).val(match.value).trigger('change'); }
+      if (s2) {
+        var chosen = s2.querySelector('.select2-chosen');
+        if (chosen) chosen.textContent = match.text.trim();
+      }
 
-        return { found: true, matched: match.text };
-      },
-      { label: labelText, search: searchValue }
-    );
+      return { found: true, matched: match.text };
+    `, labelText, searchValue);
+    // Give the slow website time to process the selection
+    // (wait is after the executeScript returns)
   }
 
-  /**
-   * Finds a native <select> by its data-staticid attribute and sets its value.
-   * Avoids label-text collisions when multiple sections share the same label
-   * (e.g. "Emirate" appears in both Host/Submitter and Contact Details).
-   */
-  /**
-   * Returns { found, matched, skipped } — skipped=true means the dropdown already had the correct value.
-   */
+  /** Wrapper that adds a pause after selectByLabel for slow pages */
+  private async selectByLabelSlow(
+    labelText: string,
+    searchValue: string
+  ): Promise<{ found: boolean; matched: string; skipped?: boolean }> {
+    const result = await this.selectByLabel(labelText, searchValue);
+    if (result.found && !result.skipped) {
+      await this.sleep(800);
+    }
+    return result;
+  }
+
   private async selectByStaticId(
     staticId: string,
     searchValue: string
   ): Promise<{ found: boolean; matched: string; skipped?: boolean }> {
-    return this.page.evaluate(
-      ({ id, search }: { id: string; search: string }) => {
-        const sel = document.querySelector<HTMLSelectElement>(`select[data-staticid="${id}"]`);
-        if (!sel) return { found: false, matched: '' };
+    return this.driver.executeScript<{ found: boolean; matched: string; skipped?: boolean }>(`
+      var id = arguments[0];
+      var search = arguments[1];
+      var sel = document.querySelector('select[data-staticid="' + id + '"]');
+      if (!sel) return { found: false, matched: '' };
 
-        // Check if already has the correct value — skip if so
-        const currentText = sel.options[sel.selectedIndex]?.text?.trim() ?? '';
-        if (currentText && !currentText.includes('Select') &&
-            (currentText.toUpperCase() === search.toUpperCase() ||
-             currentText.toUpperCase().includes(search.toUpperCase()))) {
-          return { found: true, matched: currentText, skipped: true };
-        }
+      var currentText = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].text.trim() : '';
+      if (currentText && currentText.indexOf('Select') < 0 &&
+          (currentText.toUpperCase() === search.toUpperCase() ||
+           currentText.toUpperCase().indexOf(search.toUpperCase()) >= 0)) {
+        return { found: true, matched: currentText, skipped: true };
+      }
 
-        // Unlock Select2 ReadOnly — check ancestor, preceding sibling, next sibling, and by Select2 ID convention
-        const s2 = sel.closest<HTMLElement>('.select2-container')
-          ?? (sel.previousElementSibling?.classList.contains('select2-container') ? sel.previousElementSibling as HTMLElement : null)
-          ?? (sel.nextElementSibling?.classList.contains('select2-container') ? sel.nextElementSibling as HTMLElement : null)
-          ?? document.getElementById('s2id_' + sel.id) as HTMLElement | null;
-        if (s2) {
-          s2.classList.remove('ReadOnly');
-          s2.querySelectorAll('.ReadOnly').forEach(el => el.classList.remove('ReadOnly'));
-        }
-        sel.removeAttribute('disabled');
+      var s2 = sel.closest('.select2-container')
+        || (sel.previousElementSibling && sel.previousElementSibling.classList.contains('select2-container') ? sel.previousElementSibling : null)
+        || (sel.nextElementSibling && sel.nextElementSibling.classList.contains('select2-container') ? sel.nextElementSibling : null)
+        || document.getElementById('s2id_' + sel.id);
+      if (s2) {
+        s2.classList.remove('ReadOnly');
+        s2.querySelectorAll('.ReadOnly').forEach(function(el) { el.classList.remove('ReadOnly'); });
+      }
+      sel.removeAttribute('disabled');
 
-        const opts = Array.from(sel.options);
-        const match =
-          opts.find(o => o.text.trim().toUpperCase() === search.toUpperCase()) ??
-          opts.find(o => o.text.toUpperCase().includes(search.toUpperCase()));
-        if (!match) return { found: false, matched: '' };
+      var opts = Array.from(sel.options);
+      var match = opts.find(function(o) { return o.text.trim().toUpperCase() === search.toUpperCase(); })
+        || opts.find(function(o) { return o.text.toUpperCase().indexOf(search.toUpperCase()) >= 0; });
+      if (!match) return { found: false, matched: '' };
 
-        sel.value = '';
-        sel.value = match.value;
-        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      sel.value = '';
+      sel.value = match.value;
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
 
-        // Also trigger jQuery change + update Select2 display text
-        const $ = (window as any).jQuery || (window as any).$;
-        if ($) {
-          $(sel).val(match.value).trigger('change');
-        }
-        // Update the Select2 display text directly
-        if (s2) {
-          const chosen = s2.querySelector('.select2-chosen');
-          if (chosen) chosen.textContent = match.text.trim();
-        }
+      var jq = window.jQuery || window.$;
+      if (jq) { jq(sel).val(match.value).trigger('change'); }
+      if (s2) {
+        var chosen = s2.querySelector('.select2-chosen');
+        if (chosen) chosen.textContent = match.text.trim();
+      }
 
-        return { found: true, matched: match.text };
-      },
-      { id: staticId, search: searchValue }
-    );
+      return { found: true, matched: match.text };
+    `, staticId, searchValue);
   }
 
-  /**
-   * Handles AJAX-powered Select2 dropdowns where options are fetched on search.
-   * Finds the container by matching the idFragment against element IDs (e.g.
-   * "ComingFromCountry" matches "s2id_...wtcmbComingFromCountry").
-   * Opens the dropdown, types the search term, waits for results, and clicks
-   * the matching option. Returns the matched text or empty string on failure.
-   */
   private async selectByAjaxSelect2(
     idFragment: string,
     searchValue: string
   ): Promise<string> {
-    // Find the Select2 container by ID fragment and remove ReadOnly
-    const containerId = await this.page.evaluate((frag: string) => {
-      const containers = Array.from(document.querySelectorAll<HTMLElement>('.select2-container'));
-      const match = containers.find(el => el.id.toLowerCase().includes(frag.toLowerCase()));
+    // Deep unlock: remove ReadOnly from ALL elements related to this Select2
+    const containerId = await this.driver.executeScript<string>(`
+      var frag = arguments[0];
+
+      // Find container by ID fragment
+      var containers = Array.from(document.querySelectorAll('.select2-container'));
+      var match = containers.find(function(el) { return el.id.toLowerCase().indexOf(frag.toLowerCase()) >= 0; });
+
+      // Fallback: find by nearby label text
+      if (!match) {
+        var labels = Array.from(document.querySelectorAll('label'));
+        var lbl = labels.find(function(l) {
+          return (l.textContent || '').toLowerCase().indexOf(frag.toLowerCase().replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase()) >= 0;
+        });
+        if (lbl) {
+          var el = document.getElementById(lbl.htmlFor || '');
+          if (el) {
+            match = el.previousElementSibling;
+            if (!match || !match.classList.contains('select2-container')) {
+              match = el.closest('div')?.querySelector('.select2-container') || null;
+            }
+          }
+        }
+      }
+
       if (!match) return '';
+
+      // Deep unlock: remove ReadOnly from container, all children, and parent chain
       match.classList.remove('ReadOnly');
-      match.querySelectorAll('.ReadOnly').forEach(el => el.classList.remove('ReadOnly'));
+      match.querySelectorAll('*').forEach(function(el) { el.classList.remove('ReadOnly'); });
+      var parent = match.parentElement;
+      while (parent && parent !== document.body) {
+        parent.classList.remove('ReadOnly');
+        parent = parent.parentElement;
+      }
+
+      // Also unlock the actual <select> element (usually next sibling)
+      var selectEl = match.nextElementSibling;
+      if (selectEl && selectEl.tagName === 'SELECT') {
+        selectEl.classList.remove('ReadOnly');
+        selectEl.removeAttribute('readonly');
+        selectEl.removeAttribute('disabled');
+      }
+
       return match.id;
-    }, idFragment);
+    `, idFragment);
 
     if (!containerId) {
       console.warn(`[Form] AJAX Select2 container not found for fragment: "${idFragment}".`);
       return '';
     }
 
-    // Click the Select2 choice to open the dropdown
-    // Use attribute selector to avoid CSS escaping issues with long OutSystems IDs
-    const container = this.page.locator(`[id="${containerId}"]`);
-    await container.scrollIntoViewIfNeeded();
-    await container.locator('.select2-choice').click({ timeout: 5000 });
-    await this.page.waitForTimeout(150);
+    // Scroll and click the Select2 choice to open the dropdown
+    await this.driver.executeScript(`
+      var container = document.getElementById(arguments[0]);
+      if (container) {
+        container.scrollIntoView({block:'center'});
+        var choice = container.querySelector('.select2-choice');
+        if (choice) {
+          choice.classList.remove('ReadOnly');
+          choice.click();
+        }
+      }
+    `, containerId);
+    await this.sleep(800);
 
-    // Click the pencil icon inside the search box to unlock the SmartInput
-    await this.page.evaluate(() => {
-      const drop = document.querySelector('.select2-drop-active');
+    // Unlock the dropdown panel, click pencil, enable search input
+    await this.driver.executeScript(`
+      var drop = document.querySelector('.select2-drop-active');
       if (!drop) return;
-      // Remove ReadOnly from the drop panel and all children
       drop.classList.remove('ReadOnly');
-      drop.querySelectorAll('.ReadOnly').forEach(el => el.classList.remove('ReadOnly'));
-      // Click the pencil if present
-      const pencil = drop.querySelector<HTMLElement>('.FormEditPencil');
+      drop.querySelectorAll('*').forEach(function(el) { el.classList.remove('ReadOnly'); });
+
+      var pencil = drop.querySelector('.FormEditPencil');
       if (pencil) pencil.click();
-      // Also force the search input to be editable
-      const input = drop.querySelector<HTMLInputElement>('.select2-input');
+
+      var input = drop.querySelector('.select2-input');
       if (input) {
         input.removeAttribute('readonly');
         input.removeAttribute('disabled');
         input.classList.remove('ReadOnly');
+        input.style.display = '';
+        input.style.visibility = 'visible';
+        input.focus();
       }
-    });
-    await this.page.waitForTimeout(150);
+    `);
+    await this.sleep(500);
 
-    // Type using keyboard (bypasses Playwright visibility check on SmartInput fields)
-    await this.page.keyboard.type(searchValue, { delay: 30 });
-
-    // Wait for results to appear
-    await this.page.waitForFunction(() => {
-      const results = document.querySelectorAll('.select2-drop-active .select2-results li.select2-result');
-      return results.length > 0;
-    }, { timeout: 10000 }).catch(() => {});
-
-    // Click the first matching result
-    const firstResult = this.page.locator('.select2-drop-active .select2-results li.select2-result').first();
-    if (await firstResult.isVisible({ timeout: 3000 }).catch(() => false)) {
-      const matchedText = await firstResult.textContent() ?? '';
-      await firstResult.click();
-      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-      return matchedText.trim();
+    // Type search value character by character (slow pace for AJAX)
+    const activeInput = await this.driver.switchTo().activeElement();
+    for (const char of searchValue) {
+      await activeInput.sendKeys(char);
+      await this.sleep(80);
     }
 
-    return '';
+    // Wait for AJAX results to appear (longer timeout for slow site)
+    await this.waitForCondition(async () => {
+      return this.driver.executeScript<boolean>(`
+        var results = document.querySelectorAll('.select2-drop-active .select2-results li.select2-result');
+        return results.length > 0;
+      `);
+    }, 15000).catch(() => {});
+    await this.sleep(500);
+
+    // Click the first matching result using mousedown (Select2 uses mousedown, not click)
+    const matchedText = await this.driver.executeScript<string>(`
+      var results = document.querySelectorAll('.select2-drop-active .select2-results li.select2-result');
+      if (results.length === 0) return '';
+      var item = results[0];
+      var text = item.textContent.trim();
+      // Select2 listens on mouseup after mousedown — simulate the full sequence
+      item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+      item.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+      item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      return text;
+    `);
+
+    if (matchedText) {
+      await this.sleep(1500);
+      await this.waitForPageLoad();
+      console.log(`[Form] AJAX Select2 result clicked: "${matchedText}"`);
+    }
+
+    // Verify selection took effect — if dropdown is still open, try Selenium click
+    const stillOpen = await this.driver.executeScript<boolean>(`
+      return !!document.querySelector('.select2-drop-active');
+    `);
+    if (stillOpen && matchedText) {
+      console.log('[Form] Dropdown still open — using Selenium click...');
+      try {
+        const resultEl = await this.driver.findElement(
+          By.css('.select2-drop-active .select2-results li.select2-result')
+        );
+        await resultEl.click();
+        await this.sleep(1000);
+        await this.waitForPageLoad();
+      } catch {
+        // Force close dropdown and set value programmatically
+        console.log('[Form] Selenium click failed — forcing selection via JS...');
+        await this.driver.executeScript(`
+          var frag = arguments[0];
+          var text = arguments[1];
+          // Find the underlying <select>
+          var containers = Array.from(document.querySelectorAll('.select2-container'));
+          var match = containers.find(function(el) { return el.id.toLowerCase().indexOf(frag.toLowerCase()) >= 0; });
+          if (!match) return;
+          var sel = match.nextElementSibling;
+          if (!sel || sel.tagName !== 'SELECT') return;
+          var opt = Array.from(sel.options).find(function(o) { return o.text.indexOf(text.split(' - ').pop() || text) >= 0; });
+          if (opt) {
+            sel.value = opt.value;
+            sel.dispatchEvent(new Event('change', { bubbles: true }));
+            var jq = window.jQuery || window.$;
+            if (jq) jq(sel).val(opt.value).trigger('change');
+          }
+          // Close any open dropdown
+          var drop = document.querySelector('.select2-drop-active');
+          if (drop) drop.classList.remove('select2-drop-active');
+        `, idFragment, matchedText);
+        await this.sleep(1000);
+      }
+    }
+
+    return matchedText;
   }
 
   // ── Session Keep-Alive ─────────────────────────────────────────────────────
 
-  /**
-   * Fires a lightweight HEAD request every intervalMs to reset the server-side
-   * 15-min idle timer.  Returns a stop function to cancel when done.
-   */
   private startSessionKeepAlive(intervalMs = 10 * 60 * 1000): () => void {
     console.log(`[KeepAlive] Session keep-alive started (every ${intervalMs / 60000} min).`);
     const timer = setInterval(async () => {
       try {
-        await this.page.evaluate(async () => {
-          await fetch(window.location.href, { method: 'HEAD', credentials: 'include' });
-        });
+        await this.driver.executeScript(`
+          fetch(window.location.href, { method: 'HEAD', credentials: 'include' });
+        `);
         console.log('[KeepAlive] Session ping sent.');
       } catch { /* page may be mid-navigation */ }
     }, intervalMs);
     return () => { clearInterval(timer); console.log('[KeepAlive] Stopped.'); };
+  }
+
+  // ── Selenium utility helpers ───────────────────────────────────────────────
+
+  private async waitForElement(locator: By, timeout: number): Promise<WebElement> {
+    return this.driver.wait(until.elementLocated(locator), timeout);
+  }
+
+  private async waitForPageLoad(timeout = 15000): Promise<void> {
+    try {
+      await this.driver.wait(async () => {
+        const state = await this.driver.executeScript<string>('return document.readyState');
+        return state === 'complete';
+      }, timeout);
+      // Extra wait for AJAX to settle
+      await this.sleep(500);
+    } catch {
+      // Timeout is acceptable — page may have slow-loading resources
+    }
+  }
+
+  private async waitForUrlContains(fragment: string, timeout: number): Promise<void> {
+    await this.driver.wait(until.urlContains(fragment), timeout);
+  }
+
+  private async waitForCondition(conditionFn: () => Promise<boolean>, timeout: number): Promise<void> {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (await conditionFn()) return;
+      await this.sleep(250);
+    }
+    throw new Error(`Condition not met within ${timeout}ms`);
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   private static mrzCodeToCountryName(code: string): string {
@@ -1646,16 +2274,15 @@ export class GdrfaPortalPage {
     };
     return map[code.toUpperCase()] ?? code;
   }
-
 }
 
 // ─── Convenience exports (test file imports these directly) ───────────────────
 
-/** Thin wrapper so tests can call fillApplicationForm(page, app) unchanged. */
-export async function fillApplicationForm(page: Page, application: VisaApplication): Promise<void> {
-  await new GdrfaPortalPage(page).fillApplicationForm(application);
+/** Thin wrapper so tests can call fillApplicationForm(driver, app) unchanged. Returns Application Number. */
+export async function fillApplicationForm(driver: WebDriver, application: VisaApplication): Promise<string> {
+  return new GdrfaPortalPage(driver).fillApplicationForm(application);
 }
 
-export async function verifySession(page: Page): Promise<void> {
-  await new GdrfaPortalPage(page).verifySession();
+export async function verifySession(driver: WebDriver): Promise<void> {
+  await new GdrfaPortalPage(driver).verifySession();
 }

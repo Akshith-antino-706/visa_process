@@ -1,22 +1,48 @@
-import { test } from '@playwright/test';
-import * as path from 'path';
+/**
+ * Debug utility: Launch a browser with the saved session and verify it's valid.
+ * Usage: ts-node tests/launch-browser.spec.ts
+ */
 
-const SESSION_FILE = path.resolve('auth/session.json');
+import { createDriver, loadSession, SESSION_FILE } from '../src/automation/driver-factory';
+import * as readline from 'readline';
 
-test.use({ storageState: SESSION_FILE });
+function prompt(question: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise(resolve => {
+    rl.question(question, answer => {
+      rl.close();
+      resolve(answer);
+    });
+  });
+}
 
-test('Launch browser with session', async ({ page }) => {
-  console.log('[Launch] Browser opened');
-  console.log('[Launch] Navigating to portal...');
-  await page.goto('https://smart.gdrfad.gov.ae/SmartChannels_Th/', { waitUntil: 'domcontentloaded' });
-  console.log('[Launch] URL:', page.url());
+async function main() {
+  console.log('[Launch] Creating browser with session...');
+  const driver = await createDriver();
 
-  if (page.url().includes('Login.aspx')) {
-    console.error('[Launch] Session expired — run "npm run auth" first');
-  } else {
-    console.log('[Launch] Session is valid — logged in');
+  try {
+    await loadSession(driver, SESSION_FILE);
+    console.log('[Launch] Browser opened');
+    console.log('[Launch] Navigating to portal...');
+    await driver.get('https://smart.gdrfad.gov.ae/SmartChannels_Th/');
+
+    const url = await driver.getCurrentUrl();
+    console.log('[Launch] URL:', url);
+
+    if (url.includes('Login.aspx')) {
+      console.error('[Launch] Session expired — run "npm run auth" first');
+    } else {
+      console.log('[Launch] Session is valid — logged in');
+    }
+
+    // Keep browser open for inspection
+    await prompt('[Launch] Press ENTER to close the browser... ');
+  } finally {
+    await driver.quit().catch(() => {});
   }
+}
 
-  // Keep browser open for inspection
-  await page.pause();
+main().catch(err => {
+  console.error('[Launch] Error:', err);
+  process.exit(1);
 });

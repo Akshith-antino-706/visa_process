@@ -3,11 +3,12 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "auth": "playwright test --project=setup",
+    "auth": "ts-node tests/auth.setup.ts",
     "ocr": "ts-node scripts/ocr-extract.ts",
-    "test": "playwright test --project=visa-automation",
-    "test:ui": "playwright test --project=visa-automation --ui",
-    "report": "playwright show-report",
+    "test": "ts-node tests/visa-application.spec.ts",
+    "test:one": "WORKERS=1 ts-node tests/visa-application.spec.ts",
+    "test:launch": "ts-node tests/launch-browser.spec.ts",
+    "test:check": "ts-node tests/browser-check.spec.ts",
     "excel": "ts-node scripts/json-to-excel.ts"
   },
   "keywords": [],
@@ -15,15 +16,17 @@
   "license": "ISC",
   "description": "",
   "devDependencies": {
-    "@playwright/test": "^1.58.2",
     "@types/node": "^25.2.3",
+    "@types/selenium-webdriver": "^4.1.28",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   },
   "dependencies": {
     "@types/sharp": "^0.31.1",
+    "chromedriver": "^145.0.6",
     "dotenv": "^17.3.1",
     "mrz": "^5.0.1",
+    "selenium-webdriver": "^4.27.0",
     "sharp": "^0.34.5",
     "tesseract.js": "^4.1.4",
     "xlsx": "^0.18.5"

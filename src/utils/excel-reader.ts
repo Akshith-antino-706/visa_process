@@ -119,24 +119,25 @@ function resolveDocuments(folder: string): ApplicationDocuments {
   const absFolder = path.resolve(folder);
   if (!fs.existsSync(absFolder)) return empty;
 
-  const files = fs.readdirSync(absFolder);
+  const files = fs.readdirSync(absFolder).filter(f => !f.startsWith('.') && f !== 'desktop.ini');
 
-  const find = (pattern: string): string => {
-    const match = files.find(f => f.toLowerCase().includes(pattern.toLowerCase()));
-    return match ? path.join(absFolder, match) : '';
+  // Find file matching any of the given keywords (case-insensitive)
+  const findAny = (...patterns: string[]): string => {
+    for (const pattern of patterns) {
+      const match = files.find(f => f.toLowerCase().includes(pattern.toLowerCase()));
+      if (match) return path.join(absFolder, match);
+    }
+    return '';
   };
 
   return {
-    hotelReservationPage1:     find('Hotel reservation') && !find('Page 2') ? find('Hotel reservation') :
-                                files.find(f => f.toLowerCase().includes('hotel reservation') && f.toLowerCase().includes('page 1'))
-                                  ? path.join(absFolder, files.find(f => f.toLowerCase().includes('hotel reservation') && f.toLowerCase().includes('page 1'))!)
-                                  : find('Hotel reservation'),
-    hotelReservationPage2:     files.find(f => f.toLowerCase().includes('hotel reservation') && f.toLowerCase().includes('page 2'))
-                                  ? path.join(absFolder, files.find(f => f.toLowerCase().includes('hotel reservation') && f.toLowerCase().includes('page 2'))!)
+    sponsoredPassportPage1:    findAny('Sponsored Passport page 1', 'Sponsored Passport', 'passport page 1', 'passport front'),
+    passportExternalCoverPage: findAny('Passport External Cover', 'cover page', 'passport cover'),
+    personalPhoto:             findAny('Personal Photo', 'photo'),
+    hotelReservationPage1:     findAny('Hotel reservation', 'hotel', 'tenancy contract', 'tenancy', 'accommodation'),
+    returnAirTicketPage1:      findAny('Return air ticket', 'flight ticket', 'air ticket', 'ticket', 'flight'),
+    hotelReservationPage2:     findAny('Hotel reservation') && files.find(f => f.toLowerCase().includes('hotel') && f.toLowerCase().includes('page 2'))
+                                  ? path.join(absFolder, files.find(f => f.toLowerCase().includes('hotel') && f.toLowerCase().includes('page 2'))!)
                                   : undefined,
-    passportExternalCoverPage: find('Passport External Cover'),
-    personalPhoto:             find('Personal Photo'),
-    returnAirTicketPage1:      find('Return air ticket'),
-    sponsoredPassportPage1:    find('Sponsored Passport'),
   };
 }

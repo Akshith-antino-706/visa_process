@@ -1,62 +1,98 @@
-import { test as setup, expect } from '@playwright/test';
-import * as path from 'path';
+/**
+ * Manual login & session save for Selenium.
+ *
+ * Opens a Chrome browser, navigates to the GDRFA login page, and waits
+ * for you to log in manually and solve the CAPTCHA.
+ *
+ * Usage: npm run auth
+ *
+ * After logging in:
+ *   1. Press ENTER in this terminal to save the session.
+ *   2. Open a NEW terminal and run: npm test
+ *   3. When npm test finishes, press ENTER again here to close the browser.
+ */
+
+import { createDriver, saveSession, SESSION_FILE } from '../src/automation/driver-factory';
+import * as readline from 'readline';
 import * as fs from 'fs';
 
 const PORTAL_URL  = 'https://smart.gdrfad.gov.ae/SmartChannels_Th/Login.aspx';
 const PORTAL_HOME = 'https://smart.gdrfad.gov.ae/SmartChannels_Th/';
-export const SESSION_FILE = path.resolve('auth/session.json');
+const KEEP_ALIVE_INTERVAL_MS = 4 * 60 * 1000; // 4 min
 
-const KEEP_ALIVE_INTERVAL_MS = 4 * 60 * 1000; // 4 min — well within the 15-min idle timeout
+function prompt(question: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise(resolve => {
+    rl.question(question, answer => {
+      rl.close();
+      resolve(answer);
+    });
+  });
+}
 
-setup('Manual login & save session', async ({ page }) => {
-  // Allow this test to stay open indefinitely while keep-alive is running
-  setup.setTimeout(0);
+async function main() {
+  console.log('[Auth] Launching Chrome browser...');
+  const driver = await createDriver();
 
-  // 1. Clear stale cookies so the portal cannot auto-redirect to the dashboard
-  await page.context().clearCookies();
+  try {
+    // 1. Clear stale cookies and navigate to login
+    await driver.manage().deleteAllCookies();
+    await driver.get(PORTAL_URL);
 
-  // 2. Navigate to the login page
-  await page.goto(PORTAL_URL, { waitUntil: 'domcontentloaded' });
-  if (!page.url().includes('Login.aspx')) {
-    console.warn('[Auth] Portal redirected away from Login.aspx — retrying...');
-    await page.goto(PORTAL_URL, { waitUntil: 'domcontentloaded' });
-  }
-
-  // 3. Pause — Playwright Inspector opens.
-  //    - Enter username & password
-  //    - Solve the CAPTCHA
-  //    - Click Login and wait until the dashboard loads
-  //    Then click "Resume" in the Inspector toolbar.
-  await page.pause();
-
-  // 4. Save the session (cookies + localStorage + sessionStorage)
-  console.log('\n[Auth] Saving session...');
-  await page.context().storageState({ path: SESSION_FILE });
-  console.log(`[Auth] Session saved → ${SESSION_FILE}`);
-  expect(fs.existsSync(SESSION_FILE)).toBeTruthy();
-
-  // 5. Start keep-alive immediately — ping the portal every 4 min so the
-  //    server-side idle timer never reaches 15 minutes before npm test runs.
-  const keepAlive = setInterval(async () => {
-    try {
-      await page.evaluate(async (url: string) => {
-        await fetch(url, { method: 'GET', credentials: 'include' });
-      }, PORTAL_HOME);
-      console.log('[KeepAlive] Session ping sent — idle timer reset.');
-    } catch {
-      // Ignore — browser may be mid-navigation
+    const url = await driver.getCurrentUrl();
+    if (!url.includes('Login.aspx')) {
+      console.warn('[Auth] Portal redirected away from Login.aspx — retrying...');
+      await driver.get(PORTAL_URL);
     }
-  }, KEEP_ALIVE_INTERVAL_MS);
 
-  // 6. Stay paused so the browser (and session) remain alive while npm test runs
-  console.log('\n[Auth] ─────────────────────────────────────────────────────────');
-  console.log('[Auth] Session is LIVE — keep-alive pinging every 4 min.');
-  console.log('[Auth] ► Open a NEW terminal and run:  npm test');
-  console.log('[Auth] ► Once npm test finishes, click Resume here to close.');
-  console.log('[Auth] ─────────────────────────────────────────────────────────\n');
-  await page.pause();
+    // 2. Wait for manual login
+    console.log('\n[Auth] ─────────────────────────────────────────────────────────');
+    console.log('[Auth] Browser is open. Please:');
+    console.log('[Auth]   1. Enter your username & password');
+    console.log('[Auth]   2. Solve the CAPTCHA');
+    console.log('[Auth]   3. Click Login and wait until the dashboard loads');
+    console.log('[Auth]   4. Then come back here and press ENTER');
+    console.log('[Auth] ─────────────────────────────────────────────────────────\n');
 
-  // 7. User clicked Resume — clean up and exit
-  clearInterval(keepAlive);
-  console.log('[Auth] Keep-alive stopped. Auth browser closed.');
+    await prompt('[Auth] Press ENTER after you have logged in successfully... ');
+
+    // 3. Save the session
+    console.log('\n[Auth] Saving session...');
+    await saveSession(driver, SESSION_FILE);
+    console.log(`[Auth] Session saved → ${SESSION_FILE}`);
+
+    if (!fs.existsSync(SESSION_FILE)) {
+      throw new Error('Session file was not created');
+    }
+
+    // 4. Start keep-alive
+    const keepAlive = setInterval(async () => {
+      try {
+        await driver.executeScript(`fetch('${PORTAL_HOME}', { method: 'GET', credentials: 'include' });`);
+        console.log('[KeepAlive] Session ping sent — idle timer reset.');
+      } catch {
+        // Ignore — browser may be mid-navigation
+      }
+    }, KEEP_ALIVE_INTERVAL_MS);
+
+    // 5. Stay open so session remains alive while npm test runs
+    console.log('\n[Auth] ─────────────────────────────────────────────────────────');
+    console.log('[Auth] Session is LIVE — keep-alive pinging every 4 min.');
+    console.log('[Auth] ► Open a NEW terminal and run:  npm test');
+    console.log('[Auth] ► Once npm test finishes, press ENTER here to close.');
+    console.log('[Auth] ─────────────────────────────────────────────────────────\n');
+
+    await prompt('[Auth] Press ENTER to close the auth browser... ');
+
+    // 6. Clean up
+    clearInterval(keepAlive);
+    console.log('[Auth] Keep-alive stopped. Auth browser closing.');
+  } finally {
+    await driver.quit().catch(() => {});
+  }
+}
+
+main().catch(err => {
+  console.error('[Auth] Fatal error:', err);
+  process.exit(1);
 });
