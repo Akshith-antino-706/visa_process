@@ -293,20 +293,22 @@ export class GdrfaPortalPage {
       await this.uploadSingleDocument(doc.label, filePath);
     }
 
-    console.log('[Upload] All documents processed. Waiting for page...');
-    await this.sleep(5000);
+    console.log('[Upload] All documents sent. Now waiting for Continue button...');
+    await this.sleep(2000);
 
-    // Take screenshot after uploads
+    // The goal: wait for Continue to appear and click it — that means uploads are done
+    await this.clickUploadContinue();
+
+    // Take screenshot after successful Continue click
     try {
       const screenshot = await this.driver.takeScreenshot();
-      const ssPath = path.resolve('test-results', 'after-upload.png');
+      const ssPath = path.resolve('test-results', 'after-upload-continue.png');
       fs.mkdirSync(path.dirname(ssPath), { recursive: true });
       fs.writeFileSync(ssPath, screenshot, 'base64');
       console.log(`[Upload] Screenshot: ${ssPath}`);
     } catch {}
 
-    // Click Continue
-    await this.clickUploadContinue();
+    console.log('[Upload] Upload section complete — Continue clicked successfully.');
   }
 
   /**
@@ -484,55 +486,43 @@ export class GdrfaPortalPage {
       if (tempInput.parentNode) tempInput.parentNode.removeChild(tempInput);
     `, dropZoneIndex);
 
-    // Step 5: Wait for preview/upload confirmation (up to 30 seconds)
-    console.log(`[Upload] Waiting for "${docType}" preview...`);
+    // Step 5: Brief wait for upload to process, then try direct input fallback too
+    console.log(`[Upload] Waiting for "${docType}" to process...`);
     await this.sleep(3000);
 
-    for (let attempt = 0; attempt < 10; attempt++) {
-      const hasPreview = await this.driver.executeScript<boolean>(`
-        var idx = arguments[0];
-        var fileInputs = document.querySelectorAll('input[type="file"][data-document-type]');
-        var el = fileInputs[idx];
-        if (!el) return false;
-
-        // Find the card row containing this upload
-        var card = el.closest('.ThemeGrid_Width12, [class*="Row"], [class*="uploaderCont"], [class*="CardSimple"]')
-          || el.parentElement.parentElement.parentElement.parentElement;
-        if (!card) return false;
-
-        // Check for preview image
-        var imgs = card.querySelectorAll('img');
-        for (var i = 0; i < imgs.length; i++) {
-          var src = imgs[i].getAttribute('src') || '';
-          if (src && (src.startsWith('data:') || src.startsWith('blob:') || (src.startsWith('http') && !src.includes('placeholder')))) {
-            if (window.getComputedStyle(imgs[i]).display !== 'none') return true;
-          }
+    // Quick check if preview appeared — if not, also try direct input as fallback
+    const hasPreview = await this.driver.executeScript<boolean>(`
+      var idx = arguments[0];
+      var fileInputs = document.querySelectorAll('input[type="file"][data-document-type]');
+      var el = fileInputs[idx];
+      if (!el) return false;
+      var card = el.closest('.ThemeGrid_Width12, [class*="Row"], [class*="uploaderCont"], [class*="CardSimple"]')
+        || el.parentElement.parentElement.parentElement.parentElement;
+      if (!card) return false;
+      var imgs = card.querySelectorAll('img');
+      for (var i = 0; i < imgs.length; i++) {
+        var src = imgs[i].getAttribute('src') || '';
+        if (src && (src.startsWith('data:') || src.startsWith('blob:') || (src.startsWith('http') && !src.includes('placeholder')))) {
+          if (window.getComputedStyle(imgs[i]).display !== 'none') return true;
         }
-
-        // Check for Delete/Download button (another upload-complete indicator)
-        var links = card.querySelectorAll('a, button, span');
-        for (var i = 0; i < links.length; i++) {
-          var t = (links[i].textContent || '').trim().toLowerCase();
-          if (t === 'delete' || t === 'download' || t.indexOf('delete') >= 0) return true;
-        }
-        return false;
-      `, dropZoneIndex);
-
-      if (hasPreview) {
-        console.log(`[Upload] "${docType}" — preview confirmed!`);
-        break;
       }
-      if (attempt < 9) {
-        console.log(`[Upload] "${docType}" — waiting for preview (${attempt + 1}/10)...`);
-        await this.sleep(3000);
-      } else {
-        console.warn(`[Upload] "${docType}" — no preview after 30s. Trying direct click fallback...`);
-        // Fallback: physically click the upload area and use the native file dialog approach
-        await this.uploadViaDirectInput(dropZoneIndex, filePath);
+      var links = card.querySelectorAll('a, button, span');
+      for (var i = 0; i < links.length; i++) {
+        var t = (links[i].textContent || '').trim().toLowerCase();
+        if (t === 'delete' || t === 'download' || t.indexOf('delete') >= 0) return true;
       }
+      return false;
+    `, dropZoneIndex);
+
+    if (hasPreview) {
+      console.log(`[Upload] "${docType}" — upload confirmed!`);
+    } else {
+      console.log(`[Upload] "${docType}" — no preview yet, trying direct input fallback...`);
+      await this.uploadViaDirectInput(dropZoneIndex, filePath);
+      await this.sleep(3000);
     }
 
-    await this.sleep(1000);
+    await this.sleep(500);
   }
 
   /**
