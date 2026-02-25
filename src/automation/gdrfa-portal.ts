@@ -8,7 +8,6 @@ import {
   ContactDetails,
   ApplicationDocuments,
 } from '../types/application-data';
-
 // ─── Page Object ──────────────────────────────────────────────────────────────
 
 export class GdrfaPortalPage {
@@ -123,10 +122,16 @@ export class GdrfaPortalPage {
 
       // Wait for the upload to process
       await this.page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-      await this.page.waitForTimeout(1000);
     }
 
     console.log('[Upload] All documents uploaded. Waiting for Continue button...');
+
+    // Dismiss "Existing Application" popup if it reappears on the upload page
+    const popupFrame = await this.findPopupFrame(5000);
+    if (popupFrame) {
+      console.log('[Upload] Existing application popup detected — dismissing...');
+      await this.handleExistingApplicationPopup(popupFrame);
+    }
 
     // Continue button appears only after all mandatory uploads are complete
     const continueBtn = this.page.locator(
@@ -134,7 +139,7 @@ export class GdrfaPortalPage {
     ).first();
     await continueBtn.waitFor({ state: 'visible', timeout: 60000 });
     await continueBtn.scrollIntoViewIfNeeded();
-    await continueBtn.click({ timeout: 10000 });
+    await continueBtn.click({ force: true, noWaitAfter: true });
     await this.page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
     await this.waitForLoaderToDisappear();
     console.log('[Upload] Continue clicked — done.');
@@ -161,22 +166,44 @@ export class GdrfaPortalPage {
       'a:has-text("Existing Applications")'
     ).first().click({ timeout: 15000 });
 
+    // Wait for the establishment detail page to fully load (avoids race with secondary redirects)
+    await this.page.waitForURL('**/EstablishmentDetail**', { timeout: 20000 }).catch(() => {});
+    await this.page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
     await this.page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
     await this.dismissPromoPopup();
 
-    const dropdown = this.page.locator(
-      '#EmaratechSG_Theme_wtwbLayoutEmaratechWithoutTitle_block_wtMainContent_EmaratechSG_Patterns_wtwbEstbButtonWithContextInfo_block_wtIcon_wtcntContextActionBtn'
-    );
-    await dropdown.waitFor({ state: 'visible', timeout: 15000 });
-    await dropdown.click();
-    await this.page.waitForTimeout(300);
+    const dropdownSel =
+      '#EmaratechSG_Theme_wtwbLayoutEmaratechWithoutTitle_block_wtMainContent_EmaratechSG_Patterns_wtwbEstbButtonWithContextInfo_block_wtIcon_wtcntContextActionBtn';
+    const firstOptionSel =
+      '#EmaratechSG_Theme_wtwbLayoutEmaratechWithoutTitle_block_wtMainContent_EmaratechSG_Patterns_wtwbEstbButtonWithContextInfo_block_wtContent_wtwbEstbTopServices_wtListMyServicesExperiences_ctl00_wtStartTopService';
 
-    const firstOption = this.page.locator(
-      '#EmaratechSG_Theme_wtwbLayoutEmaratechWithoutTitle_block_wtMainContent_EmaratechSG_Patterns_wtwbEstbButtonWithContextInfo_block_wtContent_wtwbEstbTopServices_wtListMyServicesExperiences_ctl00_wtStartTopService'
-    );
-    await firstOption.waitFor({ state: 'visible', timeout: 10000 });
-    console.log(`[Nav] Selecting form: "${(await firstOption.textContent())?.trim()}"`);
-    await firstOption.click();
+    const dropdown = this.page.locator(dropdownSel);
+    const dropdownVisible = await dropdown.waitFor({ state: 'visible', timeout: 15000 })
+      .then(() => true).catch(() => false);
+
+    if (dropdownVisible) {
+      await dropdown.click();
+      await this.page.waitForTimeout(150);
+
+      const firstOption = this.page.locator(firstOptionSel);
+      await firstOption.waitFor({ state: 'visible', timeout: 10000 });
+      console.log(`[Nav] Selecting form: "${(await firstOption.textContent())?.trim()}"`);
+      await firstOption.click();
+    } else {
+      // Fallback: dropdown ID not found — click "New Application" button then first service link
+      console.log('[Nav] Dropdown not found — using fallback navigation.');
+      const newAppBtn = this.page.locator('button:has-text("New Application")');
+      if (await newAppBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+        await newAppBtn.click();
+        await this.page.waitForTimeout(300);
+      }
+      const firstService = this.page.locator(
+        `${firstOptionSel}, a:has-text("New Tourism Entry Permit")`
+      ).first();
+      await firstService.waitFor({ state: 'visible', timeout: 10000 });
+      console.log(`[Nav] Selecting form (fallback): "${(await firstService.textContent())?.trim()}"`);
+      await firstService.click();
+    }
 
     await this.page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
     console.log('[Nav] Form page loaded. URL:', this.page.url());
@@ -191,10 +218,20 @@ export class GdrfaPortalPage {
 
   private async setVisitReason(): Promise<void> {
     console.log('[Form] Selecting Visit Reason → Tourism...');
-    await this.page.waitForSelector('select[data-staticid="cmbVisitReason"]', { timeout: 15000 });
+    // The select may be offscreen (in Visit Details section) — wait for DOM attachment, then scroll
+    const sel = this.page.locator('select[data-staticid="cmbVisitReason"]');
+    const attached = await sel.waitFor({ state: 'attached', timeout: 15000 }).then(() => true).catch(() => false);
+    if (!attached) {
+      console.log('[Form] Visit Reason select not found — likely pre-set by form type. Skipping.');
+      return;
+    }
+    await sel.scrollIntoViewIfNeeded().catch(() => {});
     const set = await this.page.evaluate(() => {
       const sel = document.querySelector<HTMLSelectElement>('select[data-staticid="cmbVisitReason"]');
       if (!sel) return false;
+      // Skip if already set to Tourism
+      const currentText = sel.options[sel.selectedIndex]?.text?.trim() ?? '';
+      if (currentText.toUpperCase().includes('TOURISM')) return true;
       sel.value = '1'; // 1 = Tourism
       sel.dispatchEvent(new Event('change', { bubbles: true }));
       return true;
@@ -234,7 +271,8 @@ export class GdrfaPortalPage {
     const input = this.page.locator(
       'input[staticid*="PassportNo"], input[id*="inptPassportNo"], input[id*="PassportNo"]'
     ).first();
-    await input.waitFor({ state: 'visible', timeout: 15000 });
+    await input.waitFor({ state: 'attached', timeout: 15000 });
+    await input.scrollIntoViewIfNeeded().catch(() => {});
     await input.fill(passportNumber);
     console.log('[Form] Passport Number entered.');
   }
@@ -314,52 +352,67 @@ export class GdrfaPortalPage {
     await this.clearArField('inpLastNameAr');
 
     console.log(`[Form] Filling First Name: "${passport.firstName}"...`);
-    await this.editAndFill('inpFirsttNameEn', passport.firstName);
-    await this.page.evaluate(() => (window as any).translateInputText?.('inpFirsttNameEn'));
-    await this.page.waitForTimeout(500);
-    console.log('[Form] First Name filled + translated.');
+    const firstFilled = await this.editAndFill('inpFirsttNameEn', passport.firstName);
+    if (firstFilled) {
+      await this.page.evaluate(() => (window as any).translateInputText?.('inpFirsttNameEn'));
+      await this.page.waitForTimeout(200);
+      console.log('[Form] First Name filled + translated.');
+    }
 
     if (passport.middleName) {
       console.log(`[Form] Filling Middle Name: "${passport.middleName}"...`);
-      await this.editAndFill('inpMiddleNameEn', passport.middleName);
-      await this.page.evaluate(() => (window as any).translateInputText?.('inpMiddleNameEn'));
-      await this.page.waitForTimeout(500);
-      console.log('[Form] Middle Name filled + translated.');
+      const midFilled = await this.editAndFill('inpMiddleNameEn', passport.middleName);
+      if (midFilled) {
+        await this.page.evaluate(() => (window as any).translateInputText?.('inpMiddleNameEn'));
+        await this.page.waitForTimeout(200);
+        console.log('[Form] Middle Name filled + translated.');
+      }
     } else {
       console.log('[Form] No middle name — field left blank.');
     }
 
     console.log(`[Form] Filling Last Name: "${passport.lastName}"...`);
-    await this.editAndFill('inpLastNameEn', passport.lastName);
-    await this.page.evaluate(() => (window as any).translateInputText?.('inpLastNameEn'));
-    await this.page.waitForTimeout(500);
-    console.log('[Form] Last Name filled + translated.');
+    const lastFilled = await this.editAndFill('inpLastNameEn', passport.lastName);
+    if (lastFilled) {
+      await this.page.evaluate(() => (window as any).translateInputText?.('inpLastNameEn'));
+      await this.page.waitForTimeout(200);
+      console.log('[Form] Last Name filled + translated.');
+    }
   }
 
   // ── Passport detail fields (below name fields) ─────────────────────────────
 
   private async fillPassportDetails(passport: PassportDetails): Promise<void> {
-    // Date of Birth: clear any pre-filled value first, then unlock via pencil and fill.
+    // Date of Birth
     const dob = passport.dateOfBirth.replace(/\//g, '-');  // DD/MM/YYYY → DD-MM-YYYY
     console.log(`[Form] Filling Date of Birth: "${dob}"...`);
-    // Clear the existing value before unlocking (bypasses ReadOnly directly)
-    await this.page.evaluate(() => {
+    // Check current value BEFORE clearing — skip if already correct
+    const currentDob = await this.page.evaluate(() => {
       const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpDateOfBirth"]');
-      if (el) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }
+      return el?.value?.trim() ?? '';
     });
-    await this.editAndFill('inpDateOfBirth', dob);
-    // Fire the AJAX change handler explicitly (datepicker fields need this after programmatic fill)
-    await this.page.evaluate(() => {
-      const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpDateOfBirth"]');
-      if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-    await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-    console.log('[Form] Date of Birth filled.');
+    if (currentDob && currentDob.toUpperCase() === dob.toUpperCase()) {
+      console.log(`[Skip] Date of Birth already has correct value: "${currentDob}".`);
+    } else {
+      await this.page.evaluate(() => {
+        const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpDateOfBirth"]');
+        if (el) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }
+      });
+      await this.editAndFill('inpDateOfBirth', dob);
+      await this.page.evaluate(() => {
+        const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpDateOfBirth"]');
+        if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      console.log('[Form] Date of Birth filled.');
+    }
 
     const birthCountry = GdrfaPortalPage.mrzCodeToCountryName(passport.birthCountry);
     console.log(`[Form] Setting Birth Country: "${birthCountry}"...`);
     const bcResult = await this.selectByLabel('Birth Country', birthCountry);
-    if (bcResult.found) {
+    if (bcResult.skipped) {
+      console.log(`[Skip] Birth Country already set: "${bcResult.matched}".`);
+    } else if (bcResult.found) {
       await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
       console.log(`[Form] Birth Country set: "${bcResult.matched}".`);
     } else {
@@ -371,16 +424,18 @@ export class GdrfaPortalPage {
       ? GdrfaPortalPage.mrzCodeToCountryName(passport.birthPlaceEN.trim())
       : passport.birthPlaceEN;
     console.log(`[Form] Filling Birth Place EN: "${birthPlace}"...`);
-    await this.editAndFill('inpApplicantBirthPlaceEn', birthPlace);
-    // Click the translate button (same as clicking the 🌐 icon next to the field)
-    await this.page.evaluate(() => (window as any).translateInputText('inpApplicantBirthPlaceEn'));
-    await this.page.waitForTimeout(500);
-    console.log('[Form] Birth Place EN filled + translated.');
+    const bpFilled = await this.editAndFill('inpApplicantBirthPlaceEn', birthPlace);
+    if (bpFilled) {
+      await this.page.evaluate(() => (window as any).translateInputText('inpApplicantBirthPlaceEn'));
+      await this.page.waitForTimeout(200);
+      console.log('[Form] Birth Place EN filled + translated.');
+    }
 
     console.log(`[Form] Setting Gender: "${passport.gender}"...`);
     const gResult = await this.selectByLabel('Gender', passport.gender);
-    if (gResult.found) {
-      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+    if (gResult.skipped) {
+      console.log(`[Skip] Gender already set: "${gResult.matched}".`);
+    } else if (gResult.found) {
       console.log(`[Form] Gender set: "${gResult.matched}".`);
     } else {
       console.warn(`[Form] Gender not found for: "${passport.gender}".`);
@@ -390,8 +445,9 @@ export class GdrfaPortalPage {
       const issueCountry = GdrfaPortalPage.mrzCodeToCountryName(passport.passportIssueCountry);
       console.log(`[Form] Setting Passport Issue Country: "${issueCountry}"...`);
       const icResult = await this.selectByLabel('Passport Issue Country', issueCountry);
-      if (icResult.found) {
-        await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      if (icResult.skipped) {
+        console.log(`[Skip] Passport Issue Country already set: "${icResult.matched}".`);
+      } else if (icResult.found) {
         console.log(`[Form] Passport Issue Country set: "${icResult.matched}".`);
       } else {
         console.warn(`[Form] Passport Issue Country not found for: "${issueCountry}".`);
@@ -403,44 +459,62 @@ export class GdrfaPortalPage {
     if (passport.passportIssueDate) {
       const issueDate = passport.passportIssueDate.replace(/\//g, '-');
       console.log(`[Form] Filling Passport Issue Date: "${issueDate}"...`);
-      await this.page.evaluate(() => {
+      const currentIssue = await this.page.evaluate(() => {
         const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpPassportIssueDate"]');
-        if (el) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }
+        return el?.value?.trim() ?? '';
       });
-      await this.editAndFill('inpPassportIssueDate', issueDate);
-      await this.page.evaluate(() => {
-        const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpPassportIssueDate"]');
-        if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
-      });
-      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-      console.log('[Form] Passport Issue Date filled.');
+      if (currentIssue && currentIssue.toUpperCase() === issueDate.toUpperCase()) {
+        console.log(`[Skip] Passport Issue Date already has correct value: "${currentIssue}".`);
+      } else {
+        await this.page.evaluate(() => {
+          const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpPassportIssueDate"]');
+          if (el) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }
+        });
+        await this.editAndFill('inpPassportIssueDate', issueDate);
+        await this.page.evaluate(() => {
+          const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpPassportIssueDate"]');
+          if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+        console.log('[Form] Passport Issue Date filled.');
+      }
     } else {
       console.log('[Form] Passport Issue Date — skipped (empty).');
     }
 
     const expiryDate = passport.passportExpiryDate.replace(/\//g, '-');
     console.log(`[Form] Filling Passport Expiry Date: "${expiryDate}"...`);
-    await this.page.evaluate(() => {
+    const currentExpiry = await this.page.evaluate(() => {
       const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpPassportExpiryDate"]');
-      if (el) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }
+      return el?.value?.trim() ?? '';
     });
-    await this.editAndFill('inpPassportExpiryDate', expiryDate);
-    await this.page.evaluate(() => {
-      const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpPassportExpiryDate"]');
-      if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-    await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-    console.log('[Form] Passport Expiry Date filled.');
+    if (currentExpiry && currentExpiry.toUpperCase() === expiryDate.toUpperCase()) {
+      console.log(`[Skip] Passport Expiry Date already has correct value: "${currentExpiry}".`);
+    } else {
+      await this.page.evaluate(() => {
+        const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpPassportExpiryDate"]');
+        if (el) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }
+      });
+      await this.editAndFill('inpPassportExpiryDate', expiryDate);
+      await this.page.evaluate(() => {
+        const el = document.querySelector<HTMLInputElement>('input[data-staticid="inpPassportExpiryDate"]');
+        if (el) el.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      console.log('[Form] Passport Expiry Date filled.');
+    }
 
     if (passport.passportPlaceOfIssueEN) {
       const placeOfIssue = /^[A-Z]{3}$/.test(passport.passportPlaceOfIssueEN.trim())
         ? GdrfaPortalPage.mrzCodeToCountryName(passport.passportPlaceOfIssueEN.trim())
         : passport.passportPlaceOfIssueEN;
       console.log(`[Form] Filling Place of Issue EN: "${placeOfIssue}"...`);
-      await this.editAndFill('inpPassportPlaceIssueEn', placeOfIssue);
-      await this.page.evaluate(() => (window as any).translateInputText?.('inpPassportPlaceIssueEn'));
-      await this.page.waitForTimeout(500);
-      console.log('[Form] Place of Issue EN filled + translated.');
+      const poiFilled = await this.editAndFill('inpPassportPlaceIssueEn', placeOfIssue);
+      if (poiFilled) {
+        await this.page.evaluate(() => (window as any).translateInputText?.('inpPassportPlaceIssueEn'));
+        await this.page.waitForTimeout(200);
+        console.log('[Form] Place of Issue EN filled + translated.');
+      }
     } else {
       console.log('[Form] Place of Issue EN — skipped (empty).');
     }
@@ -467,10 +541,12 @@ export class GdrfaPortalPage {
     // Mother Name EN (+ auto-translate to Arabic)
     if (applicant.motherNameEN) {
       console.log(`[Form] Filling Mother Name EN: "${applicant.motherNameEN}"...`);
-      await this.editAndFill('inpMotherNameEn', applicant.motherNameEN);
-      await this.page.evaluate(() => (window as any).translateInputText?.('inpMotherNameEn'));
-      await this.page.waitForTimeout(500);
-      console.log('[Form] Mother Name EN filled + translated.');
+      const motherFilled = await this.editAndFill('inpMotherNameEn', applicant.motherNameEN);
+      if (motherFilled) {
+        await this.page.evaluate(() => (window as any).translateInputText?.('inpMotherNameEn'));
+        await this.page.waitForTimeout(200);
+        console.log('[Form] Mother Name EN filled + translated.');
+      }
     } else {
       console.log('[Form] Mother Name EN — skipped (empty).');
     }
@@ -479,7 +555,9 @@ export class GdrfaPortalPage {
     if (applicant.maritalStatus) {
       console.log(`[Form] Setting Marital Status: "${applicant.maritalStatus}"...`);
       const msResult = await this.selectByLabel('Marital Status', applicant.maritalStatus);
-      if (msResult.found) {
+      if (msResult.skipped) {
+        console.log(`[Skip] Marital Status already set: "${msResult.matched}".`);
+      } else if (msResult.found) {
         console.log(`[Form] Marital Status set: "${msResult.matched}".`);
       } else {
         console.warn(`[Form] Marital Status not found for: "${applicant.maritalStatus}".`);
@@ -490,7 +568,9 @@ export class GdrfaPortalPage {
     if (applicant.religion) {
       console.log(`[Form] Setting Religion: "${applicant.religion}"...`);
       const rResult = await this.selectByLabel('Religion', applicant.religion);
-      if (rResult.found) {
+      if (rResult.skipped) {
+        console.log(`[Skip] Religion already set: "${rResult.matched}".`);
+      } else if (rResult.found) {
         await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
         console.log(`[Form] Religion set: "${rResult.matched}".`);
       } else {
@@ -501,54 +581,64 @@ export class GdrfaPortalPage {
     // Faith (options depend on Religion — must be set after Religion AJAX resolves)
     if (applicant.faith) {
       console.log(`[Form] Setting Faith: "${applicant.faith}"...`);
-      // Wait until the Faith dropdown has been populated (more than just "-- Select --")
-      await this.page.waitForFunction(() => {
+
+      // Check if Faith already has correct value — skip the entire Select2 interaction
+      const currentFaith = await this.page.evaluate(() => {
         const sel = document.querySelector<HTMLSelectElement>('select[data-staticid="cmbApplicantFaith"]');
-        return sel ? sel.options.length > 1 : false;
-      }, { timeout: 10000 }).catch(() => console.warn('[Form] Faith dropdown did not populate in time.'));
-
-      // Remove ReadOnly from the Select2 container (preceding sibling of the native <select>)
-      await this.page.evaluate(() => {
-        const sel = document.querySelector('select[data-staticid="cmbApplicantFaith"]');
-        if (!sel) return;
-        const container = sel.previousElementSibling;
-        if (container?.classList.contains('select2-container')) {
-          container.classList.remove('ReadOnly');
-          container.querySelectorAll('.ReadOnly').forEach(el => el.classList.remove('ReadOnly'));
-        }
+        if (!sel) return '';
+        return sel.options[sel.selectedIndex]?.text?.trim() ?? '';
       });
-
-      // Click the Select2 choice link to open the dropdown
-      const faithContainer = this.page.locator('[data-staticid="cmbApplicantFaith"]')
-        .locator('xpath=preceding-sibling::div[contains(@class,"select2-container")]');
-      await faithContainer.locator('.select2-choice').click({ timeout: 5000 });
-      await this.page.waitForTimeout(100);
-
-      // Remove ReadOnly from the drop panel (separate element appended to <body>)
-      await this.page.evaluate(() => {
-        const drop = document.querySelector('.select2-drop-active');
-        if (drop) {
-          drop.classList.remove('ReadOnly');
-          drop.querySelectorAll('.ReadOnly').forEach(el => el.classList.remove('ReadOnly'));
-        }
-      });
-      await this.page.waitForTimeout(100);
-
-      // Click the matching option from the results
-      const faithOption = this.page.locator('.select2-drop-active .select2-results li').filter({ hasText: applicant.faith }).first();
-      if (await faithOption.isVisible({ timeout: 5000 }).catch(() => false)) {
-        const matchedText = await faithOption.textContent() ?? '';
-        await faithOption.click();
-        await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-        console.log(`[Form] Faith set: "${matchedText.trim()}".`);
+      if (currentFaith && !currentFaith.includes('Select') &&
+          currentFaith.toUpperCase().includes(applicant.faith.toUpperCase())) {
+        console.log(`[Skip] Faith already set: "${currentFaith}".`);
       } else {
-        // Fallback: set value programmatically
-        console.warn(`[Form] Faith UI click failed — trying programmatic fallback...`);
-        const fResult = await this.selectByStaticId('cmbApplicantFaith', applicant.faith);
-        if (fResult.found) {
-          console.log(`[Form] Faith set (programmatic): "${fResult.matched}".`);
+        // Wait until the Faith dropdown has been populated (more than just "-- Select --")
+        await this.page.waitForFunction(() => {
+          const sel = document.querySelector<HTMLSelectElement>('select[data-staticid="cmbApplicantFaith"]');
+          return sel ? sel.options.length > 1 : false;
+        }, { timeout: 10000 }).catch(() => console.warn('[Form] Faith dropdown did not populate in time.'));
+
+        // Remove ReadOnly from the Select2 container (preceding sibling of the native <select>)
+        await this.page.evaluate(() => {
+          const sel = document.querySelector('select[data-staticid="cmbApplicantFaith"]');
+          if (!sel) return;
+          const container = sel.previousElementSibling;
+          if (container?.classList.contains('select2-container')) {
+            container.classList.remove('ReadOnly');
+            container.querySelectorAll('.ReadOnly').forEach(el => el.classList.remove('ReadOnly'));
+          }
+        });
+
+        // Click the Select2 choice link to open the dropdown
+        const faithContainer = this.page.locator('[data-staticid="cmbApplicantFaith"]')
+          .locator('xpath=preceding-sibling::div[contains(@class,"select2-container")]');
+        await faithContainer.locator('.select2-choice').click({ timeout: 5000 });
+
+        // Remove ReadOnly from the drop panel (separate element appended to <body>)
+        await this.page.evaluate(() => {
+          const drop = document.querySelector('.select2-drop-active');
+          if (drop) {
+            drop.classList.remove('ReadOnly');
+            drop.querySelectorAll('.ReadOnly').forEach(el => el.classList.remove('ReadOnly'));
+          }
+        });
+
+        // Click the matching option from the results
+        const faithOption = this.page.locator('.select2-drop-active .select2-results li').filter({ hasText: applicant.faith }).first();
+        if (await faithOption.isVisible({ timeout: 5000 }).catch(() => false)) {
+          const matchedText = await faithOption.textContent() ?? '';
+          await faithOption.click();
+          await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+          console.log(`[Form] Faith set: "${matchedText.trim()}".`);
         } else {
-          console.warn(`[Form] Faith not found for: "${applicant.faith}".`);
+          // Fallback: set value programmatically
+          console.warn(`[Form] Faith UI click failed — trying programmatic fallback...`);
+          const fResult = await this.selectByStaticId('cmbApplicantFaith', applicant.faith);
+          if (fResult.found) {
+            console.log(`[Form] Faith set (programmatic): "${fResult.matched}".`);
+          } else {
+            console.warn(`[Form] Faith not found for: "${applicant.faith}".`);
+          }
         }
       }
     }
@@ -557,7 +647,9 @@ export class GdrfaPortalPage {
     if (applicant.education) {
       console.log(`[Form] Setting Education: "${applicant.education}"...`);
       const eResult = await this.selectByLabel('Education', applicant.education);
-      if (eResult.found) {
+      if (eResult.skipped) {
+        console.log(`[Skip] Education already set: "${eResult.matched}".`);
+      } else if (eResult.found) {
         console.log(`[Form] Education set: "${eResult.matched}".`);
       } else {
         console.warn(`[Form] Education not found for: "${applicant.education}".`);
@@ -566,6 +658,14 @@ export class GdrfaPortalPage {
 
     // Profession (autocomplete widget — type "SALES" and select "SALES EXECUTIVE")
     {
+      // Check if profession is already filled (hidden input stores the selected value)
+      const currentProf = await this.page.evaluate(() => {
+        const hidden = document.querySelector<HTMLInputElement>('input[id*="wtProfession"][type="hidden"]');
+        return hidden?.value?.trim() ?? '';
+      });
+      if (currentProf) {
+        console.log(`[Skip] Profession already set (value: "${currentProf}").`);
+      } else {
       console.log('[Form] Filling Profession: typing "SALES" → selecting "SALES EXECUTIVE"...');
       const profInput = this.page
         .locator('input[id*="wtProfessionSerch"]')
@@ -573,7 +673,7 @@ export class GdrfaPortalPage {
       if (await profInput.isVisible({ timeout: 3000 }).catch(() => false)) {
         await profInput.click();
         await profInput.clear();
-        await this.page.keyboard.type('SALES', { delay: 80 });
+        await this.page.keyboard.type('SALES', { delay: 40 });
 
         // Wait for the autocomplete dropdown
         const suggestionList = this.page.locator('ul.os-internal-ui-autocomplete li.os-internal-ui-menu-item');
@@ -602,6 +702,7 @@ export class GdrfaPortalPage {
       } else {
         console.warn('[Form] Profession input not found.');
       }
+      } // end else (profession not yet set)
     }
 
     // Coming From Country (AJAX Select2 — options loaded on search)
@@ -626,28 +727,27 @@ export class GdrfaPortalPage {
     if (contact.email) {
       console.log(`[Form] Filling Email: "${contact.email}"...`);
       await this.editAndFill('inpEmail', contact.email);
-      console.log('[Form] Email filled.');
     }
 
     // Mobile Number
     if (contact.mobileNumber) {
       console.log(`[Form] Filling Mobile Number: "${contact.mobileNumber}"...`);
       await this.editAndFill('inpMobileNumber', contact.mobileNumber);
-      console.log('[Form] Mobile Number filled.');
     }
 
     // Approval Email Copy (optional)
     if (contact.approvalEmailCopy) {
       console.log(`[Form] Filling Approval Email Copy: "${contact.approvalEmailCopy}"...`);
       await this.editAndFill('inpApprovalEmailCopy', contact.approvalEmailCopy);
-      console.log('[Form] Approval Email Copy filled.');
     }
 
     // Preferred SMS Language
     if (contact.preferredSMSLanguage) {
       console.log(`[Form] Setting Preferred SMS Language: "${contact.preferredSMSLanguage}"...`);
       const langResult = await this.selectByLabel('Preferred SMS Language', contact.preferredSMSLanguage);
-      if (langResult.found) {
+      if (langResult.skipped) {
+        console.log(`[Skip] Preferred SMS Language already set: "${langResult.matched}".`);
+      } else if (langResult.found) {
         console.log(`[Form] Preferred SMS Language set: "${langResult.matched}".`);
       } else {
         console.warn(`[Form] Preferred SMS Language not found for: "${contact.preferredSMSLanguage}".`);
@@ -662,7 +762,9 @@ export class GdrfaPortalPage {
     if (contact.uaeEmirate) {
       console.log(`[Form] Setting Emirate: "${contact.uaeEmirate}"...`);
       const emResult = await this.selectByStaticId('cmbAddressInsideEmiratesId', contact.uaeEmirate);
-      if (emResult.found) {
+      if (emResult.skipped) {
+        console.log(`[Skip] Emirate already set: "${emResult.matched}".`);
+      } else if (emResult.found) {
         await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
         console.log(`[Form] Emirate set: "${emResult.matched}".`);
       } else {
@@ -678,7 +780,9 @@ export class GdrfaPortalPage {
         return sel ? sel.options.length > 1 : false;
       }, { timeout: 10000 }).catch(() => console.warn('[Form] City dropdown did not populate in time.'));
       const cityResult = await this.selectByStaticId('cmbAddressInsideCityId', contact.uaeCity);
-      if (cityResult.found) {
+      if (cityResult.skipped) {
+        console.log(`[Skip] City already set: "${cityResult.matched}".`);
+      } else if (cityResult.found) {
         await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
         console.log(`[Form] City set: "${cityResult.matched}".`);
       } else {
@@ -694,7 +798,9 @@ export class GdrfaPortalPage {
         return sel ? sel.options.length > 1 : false;
       }, { timeout: 10000 }).catch(() => console.warn('[Form] Area dropdown did not populate in time.'));
       const areaResult = await this.selectByStaticId('cmbAddressInsideAreaId', contact.uaeArea);
-      if (areaResult.found) {
+      if (areaResult.skipped) {
+        console.log(`[Skip] Area already set: "${areaResult.matched}".`);
+      } else if (areaResult.found) {
         console.log(`[Form] Area set: "${areaResult.matched}".`);
       } else {
         console.warn(`[Form] Area not found for: "${contact.uaeArea}".`);
@@ -705,28 +811,24 @@ export class GdrfaPortalPage {
     if (contact.uaeStreet) {
       console.log(`[Form] Filling Street: "${contact.uaeStreet}"...`);
       await this.editAndFill('inpAddressInsideStreet2', contact.uaeStreet);
-      console.log('[Form] Street filled.');
     }
 
     // Building/Villa
     if (contact.uaeBuilding) {
       console.log(`[Form] Filling Building/Villa: "${contact.uaeBuilding}"...`);
       await this.editAndFill('inpAddressInsideBuilding', contact.uaeBuilding);
-      console.log('[Form] Building/Villa filled.');
     }
 
     // Floor
     if (contact.uaeFloor) {
       console.log(`[Form] Filling Floor: "${contact.uaeFloor}"...`);
       await this.editAndFill('inpFloorNo', contact.uaeFloor);
-      console.log('[Form] Floor filled.');
     }
 
     // Flat/Villa no.
     if (contact.uaeFlat) {
       console.log(`[Form] Filling Flat/Villa no.: "${contact.uaeFlat}"...`);
       await this.editAndFill('inpFlatNo', contact.uaeFlat);
-      console.log('[Form] Flat/Villa no. filled.');
     }
 
     // ── Address Outside UAE ─────────────────────────────────────────────────
@@ -736,7 +838,9 @@ export class GdrfaPortalPage {
       const countryName = GdrfaPortalPage.mrzCodeToCountryName(contact.outsideCountry);
       console.log(`[Form] Setting Outside Country: "${countryName}"...`);
       const ocResult = await this.selectByStaticId('cmbApplicantOutsideCountry', countryName);
-      if (ocResult.found) {
+      if (ocResult.skipped) {
+        console.log(`[Skip] Outside Country already set: "${ocResult.matched}".`);
+      } else if (ocResult.found) {
         await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
         console.log(`[Form] Outside Country set: "${ocResult.matched}".`);
       } else {
@@ -748,21 +852,18 @@ export class GdrfaPortalPage {
     if (contact.outsideMobile) {
       console.log(`[Form] Filling Outside Mobile: "${contact.outsideMobile}"...`);
       await this.editAndFill('inpAddressOutsideMobileNumber', contact.outsideMobile);
-      console.log('[Form] Outside Mobile filled.');
     }
 
     // City (outside UAE)
     if (contact.outsideCity) {
       console.log(`[Form] Filling Outside City: "${contact.outsideCity}"...`);
       await this.editAndFill('inpAddressOutsideCity', contact.outsideCity);
-      console.log('[Form] Outside City filled.');
     }
 
     // Address (outside UAE)
     if (contact.outsideAddress) {
       console.log(`[Form] Filling Outside Address: "${contact.outsideAddress}"...`);
       await this.editAndFill('inpAddressOutsideAddress1', contact.outsideAddress);
-      console.log('[Form] Outside Address filled.');
     }
   }
 
@@ -880,8 +981,8 @@ export class GdrfaPortalPage {
    */
   private async getEmptyRequiredFields(
     app: VisaApplication,
-  ): Promise<Array<{ name: string; retry: () => Promise<void> }>> {
-    const empty: Array<{ name: string; retry: () => Promise<void> }> = [];
+  ): Promise<Array<{ name: string; retry: () => Promise<unknown> }>> {
+    const empty: Array<{ name: string; retry: () => Promise<unknown> }> = [];
 
     // Helper: check if a text input (by data-staticid) has a value
     const inputHasValue = async (staticId: string): Promise<boolean> => {
@@ -1141,7 +1242,20 @@ export class GdrfaPortalPage {
    * Clicks the pencil icon to switch a SmartInput field from ReadOnly to edit mode,
    * scrolls it into view first, then fills it.  Falls back to JS if the pencil fails.
    */
-  private async editAndFill(staticId: string, value: string): Promise<void> {
+  /**
+   * Returns true if the field was actually filled, false if skipped (already has correct value).
+   */
+  private async editAndFill(staticId: string, value: string): Promise<boolean> {
+    // Check if the field already has the correct value — skip if so
+    const currentVal = await this.page.evaluate((id: string) => {
+      const el = document.querySelector<HTMLInputElement>(`input[data-staticid="${id}"]`);
+      return el?.value?.trim() ?? '';
+    }, staticId);
+    if (currentVal !== '' && currentVal.toUpperCase() === value.trim().toUpperCase()) {
+      console.log(`[Skip] "${staticId}" already has correct value: "${currentVal}".`);
+      return false;
+    }
+
     // Scroll the field into view first
     await this.page.evaluate((id: string) => {
       const input = document.querySelector<HTMLInputElement>(`input[data-staticid="${id}"]`);
@@ -1192,6 +1306,7 @@ export class GdrfaPortalPage {
         el.dispatchEvent(new Event('change', { bubbles: true }));
       }, { id: staticId, val: value });
     }
+    return true;
   }
 
   /** Clears a ReadOnly Arabic SmartInput field via JS (CSS-hidden, no pencil available). */
@@ -1207,10 +1322,13 @@ export class GdrfaPortalPage {
    * searching option text.  More reliable than data-staticid because the
    * label → htmlFor → <select> chain is always present regardless of staticid.
    */
+  /**
+   * Returns { found, matched, skipped } — skipped=true means the dropdown already had the correct value.
+   */
   private async selectByLabel(
     labelText: string,
     searchValue: string
-  ): Promise<{ found: boolean; matched: string }> {
+  ): Promise<{ found: boolean; matched: string; skipped?: boolean }> {
     return this.page.evaluate(
       ({ label, search }: { label: string; search: string }) => {
         // Skip Select2's auto-generated offscreen labels
@@ -1225,6 +1343,14 @@ export class GdrfaPortalPage {
           ? el
           : el?.parentElement?.querySelector<HTMLSelectElement>('select') ?? null;
         if (!sel) return { found: false, matched: '' };
+
+        // Check if already has the correct value — skip if so
+        const currentText = sel.options[sel.selectedIndex]?.text?.trim() ?? '';
+        if (currentText && !currentText.includes('Select') &&
+            (currentText.toUpperCase() === search.toUpperCase() ||
+             currentText.toUpperCase().includes(search.toUpperCase()))) {
+          return { found: true, matched: currentText, skipped: true };
+        }
 
         // Unlock SmartInput ReadOnly — check ancestor, preceding sibling, next sibling, and by Select2 ID convention
         const s2 = sel.closest<HTMLElement>('.select2-container')
@@ -1269,14 +1395,25 @@ export class GdrfaPortalPage {
    * Avoids label-text collisions when multiple sections share the same label
    * (e.g. "Emirate" appears in both Host/Submitter and Contact Details).
    */
+  /**
+   * Returns { found, matched, skipped } — skipped=true means the dropdown already had the correct value.
+   */
   private async selectByStaticId(
     staticId: string,
     searchValue: string
-  ): Promise<{ found: boolean; matched: string }> {
+  ): Promise<{ found: boolean; matched: string; skipped?: boolean }> {
     return this.page.evaluate(
       ({ id, search }: { id: string; search: string }) => {
         const sel = document.querySelector<HTMLSelectElement>(`select[data-staticid="${id}"]`);
         if (!sel) return { found: false, matched: '' };
+
+        // Check if already has the correct value — skip if so
+        const currentText = sel.options[sel.selectedIndex]?.text?.trim() ?? '';
+        if (currentText && !currentText.includes('Select') &&
+            (currentText.toUpperCase() === search.toUpperCase() ||
+             currentText.toUpperCase().includes(search.toUpperCase()))) {
+          return { found: true, matched: currentText, skipped: true };
+        }
 
         // Unlock Select2 ReadOnly — check ancestor, preceding sibling, next sibling, and by Select2 ID convention
         const s2 = sel.closest<HTMLElement>('.select2-container')
@@ -1347,7 +1484,7 @@ export class GdrfaPortalPage {
     const container = this.page.locator(`[id="${containerId}"]`);
     await container.scrollIntoViewIfNeeded();
     await container.locator('.select2-choice').click({ timeout: 5000 });
-    await this.page.waitForTimeout(300);
+    await this.page.waitForTimeout(150);
 
     // Click the pencil icon inside the search box to unlock the SmartInput
     await this.page.evaluate(() => {
@@ -1367,11 +1504,10 @@ export class GdrfaPortalPage {
         input.classList.remove('ReadOnly');
       }
     });
-    await this.page.waitForTimeout(300);
+    await this.page.waitForTimeout(150);
 
     // Type using keyboard (bypasses Playwright visibility check on SmartInput fields)
-    await this.page.keyboard.type(searchValue, { delay: 50 });
-    await this.page.waitForTimeout(300); // Wait for AJAX results
+    await this.page.keyboard.type(searchValue, { delay: 30 });
 
     // Wait for results to appear
     await this.page.waitForFunction(() => {
@@ -1410,9 +1546,6 @@ export class GdrfaPortalPage {
     return () => { clearInterval(timer); console.log('[KeepAlive] Stopped.'); };
   }
 
-  // ── Country code → portal display name ────────────────────────────────────
-
-  /** Maps a 3-letter MRZ ISO code to the country name used in GDRFA Select2 dropdowns. */
   private static mrzCodeToCountryName(code: string): string {
     const map: Record<string, string> = {
       AFG: 'AFGHANISTAN',   ALB: 'ALBANIA',       DZA: 'ALGERIA',       AND: 'ANDORRA',
@@ -1461,6 +1594,7 @@ export class GdrfaPortalPage {
     };
     return map[code.toUpperCase()] ?? code;
   }
+
 }
 
 // ─── Convenience exports (test file imports these directly) ───────────────────
