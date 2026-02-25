@@ -1,26 +1,22 @@
 import { defineConfig } from '@playwright/test';
-import * as path from 'path';
-
-const SESSION_FILE = path.resolve('auth/session.json');
-
 export default defineConfig({
   testDir: './tests',
-  fullyParallel: false,       // Run sequentially — portal forms are stateful
+  fullyParallel: true,        // Run applicants in parallel across workers
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
-  workers: 1,                 // Single worker to avoid overlapping sessions
+  workers: 2,                 // 2 parallel browser windows
   reporter: 'html',
 
   timeout: 600_000,          // 10 minutes per test (form fill + document upload + pauses)
   use: {
-    trace: 'on-first-retry',
+    trace: 'off',
     headless: false,           // Always headed — needed for form visibility
     viewport: null,            // null = let the browser use its natural/maximized size
     launchOptions: {
       args: ['--start-maximized'],  // Start Chrome maximized (full screen)
     },
     screenshot: 'only-on-failure',
-    video: 'on',              // Record video of every test run
+    video: 'off',
     actionTimeout: 20_000,    // 20 s per individual action/click
   },
 
@@ -38,9 +34,12 @@ export default defineConfig({
     {
       name: 'visa-automation',
       testMatch: '**/visa-application.spec.ts',
-      use: {
-        storageState: SESSION_FILE,   // Inject saved cookies/session automatically
-      },
+    },
+
+    // ── Quick browser launch test ─────────────────────────────────────────────
+    {
+      name: 'launch',
+      testMatch: '**/launch-browser.spec.ts',
     },
   ],
 });

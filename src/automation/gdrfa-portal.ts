@@ -62,8 +62,7 @@ export class GdrfaPortalPage {
       // Upload documents on the Attachments tab
       await this.uploadDocuments(application.documents);
 
-      console.log('\n[Flow] ─── Steps complete. Pausing for review. ───\n');
-      await this.page.pause();
+      console.log('\n[Flow] ─── Steps complete. ───\n');
     } finally {
       stopKeepAlive();
     }
@@ -71,55 +70,74 @@ export class GdrfaPortalPage {
 
   async uploadDocuments(docs: ApplicationDocuments): Promise<void> {
     console.log('[Upload] Starting document upload...');
+    await this.page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
 
-    // Map document type labels (from data-document-type attribute) to file paths
-    const slots: Array<{ docType: string; file: string }> = [
-      { docType: 'Hotel reservation/Place of stay - Page 1', file: docs.hotelReservationPage1 },
-      { docType: 'Hotel reservation/Place of stay - Page 2', file: docs.hotelReservationPage2 ?? '' },
-      { docType: 'Passport External Cover Page',             file: docs.passportExternalCoverPage },
-      { docType: 'Personal Photo',                           file: docs.personalPhoto },
-      { docType: 'Return air ticket - Page 1',               file: docs.returnAirTicketPage1 },
-      { docType: 'Sponsored Passport page 1',                file: docs.sponsoredPassportPage1 },
+    // Map document type labels to file paths.
+    // Labels must match the data-document-type attribute on each input[type="file"].
+    const slots: Array<{ label: string; file: string }> = [
+      { label: 'Hotel reservation/Place of stay - Page 1', file: docs.hotelReservationPage1 },
+      { label: 'Hotel reservation/Place of stay - Page 2', file: docs.hotelReservationPage2 ?? '' },
+      { label: 'Passport External Cover Page',             file: docs.passportExternalCoverPage },
+      { label: 'Personal Photo',                           file: docs.personalPhoto },
+      { label: 'Return air ticket - Page 1',               file: docs.returnAirTicketPage1 },
+      { label: 'Sponsored Passport page 1',                file: docs.sponsoredPassportPage1 },
     ];
+
+    // Log all available document types on the page for debugging
+    const availableTypes = await this.page.evaluate(() =>
+      Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"][data-document-type]'))
+        .map(el => el.getAttribute('data-document-type') ?? '')
+    );
+    console.log(`[Upload] Available document types on page: ${JSON.stringify(availableTypes)}`);
 
     for (const slot of slots) {
       if (!slot.file) continue;
 
       const filePath = path.resolve(slot.file);
       if (!fs.existsSync(filePath)) {
-        console.warn(`[Upload] File not found, skipping "${slot.docType}": ${filePath}`);
+        console.warn(`[Upload] File not found, skipping "${slot.label}": ${filePath}`);
         continue;
       }
 
-      // Find the file input by its data-document-type attribute
-      const fileInput = this.page.locator(`input[type="file"][data-document-type="${slot.docType}"]`);
-      if (!await fileInput.count()) {
-        console.warn(`[Upload] Slot not found on page: "${slot.docType}"`);
-        continue;
+      // Match by data-document-type attribute (exact match first, then case-insensitive)
+      let fileInput = this.page.locator(`input[type="file"][data-document-type="${slot.label}"]`);
+      if (await fileInput.count() === 0) {
+        // Fallback: case-insensitive search via evaluate
+        const matchIdx = await this.page.evaluate((label: string) => {
+          const inputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"][data-document-type]'));
+          const target = label.toLowerCase();
+          const idx = inputs.findIndex(el => (el.getAttribute('data-document-type') ?? '').toLowerCase() === target);
+          return idx;
+        }, slot.label);
+
+        if (matchIdx < 0) {
+          console.warn(`[Upload] Slot not found on page: "${slot.label}"`);
+          continue;
+        }
+        fileInput = this.page.locator('input[type="file"][data-document-type]').nth(matchIdx);
       }
 
-      // Scroll the upload section into view
-      await fileInput.evaluate(el => el.closest('.upload-container, .os-internal-ui-upload, [class*="Upload"], div')?.scrollIntoView({ block: 'center', behavior: 'instant' }));
       await fileInput.scrollIntoViewIfNeeded().catch(() => {});
-
       await fileInput.setInputFiles(filePath);
-      console.log(`[Upload] "${slot.docType}": ${path.basename(filePath)}`);
+      console.log(`[Upload] "${slot.label}": ${path.basename(filePath)}`);
 
-      // Wait for the upload to process (portal triggers an AJAX handler via OsNotify)
-      await this.page.waitForTimeout(3000);
-      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      // Wait for the upload to process
+      await this.page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      await this.page.waitForTimeout(1000);
     }
 
-    console.log('[Upload] All documents uploaded.');
+    console.log('[Upload] All documents uploaded. Waiting for Continue button...');
 
-    // Click Continue to proceed to payment/next step
-    console.log('[Upload] Clicking Continue to proceed...');
-    const continueBtn = this.page.locator('input[staticid="SmartChannels_ApplicationUploadDocuments_btnContinue"]');
+    // Continue button appears only after all mandatory uploads are complete
+    const continueBtn = this.page.locator(
+      'input[value="Continue"], button:has-text("Continue"), a:has-text("Continue")'
+    ).first();
+    await continueBtn.waitFor({ state: 'visible', timeout: 60000 });
     await continueBtn.scrollIntoViewIfNeeded();
     await continueBtn.click({ timeout: 10000 });
     await this.page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
     await this.waitForLoaderToDisappear();
-    console.log('[Upload] Continue clicked — moved to next step.');
+    console.log('[Upload] Continue clicked — done.');
   }
 
   // ── Navigation ─────────────────────────────────────────────────────────────
@@ -128,10 +146,9 @@ export class GdrfaPortalPage {
     const SKIP_ID = 'WebPatterns_wt2_block_wtMainContent_wt3_EmaratechSG_Patterns_wt8_block_wtMainContent_wt10';
     try {
       const skipBtn = this.page.frameLocator('iframe').locator(`#${SKIP_ID}, input[value="Skip"]`).first();
-      if (!await skipBtn.isVisible({ timeout: 15000 }).catch(() => false)) return;
+      if (!await skipBtn.isVisible({ timeout: 3000 }).catch(() => false)) return;
       await skipBtn.click();
       console.log('[Nav] Dismissed promotional popup.');
-      await this.page.waitForTimeout(600);
     } catch { /* non-fatal — popup does not appear on every load */ }
   }
 
@@ -152,7 +169,7 @@ export class GdrfaPortalPage {
     );
     await dropdown.waitFor({ state: 'visible', timeout: 15000 });
     await dropdown.click();
-    await this.page.waitForTimeout(1000);
+    await this.page.waitForTimeout(300);
 
     const firstOption = this.page.locator(
       '#EmaratechSG_Theme_wtwbLayoutEmaratechWithoutTitle_block_wtMainContent_EmaratechSG_Patterns_wtwbEstbButtonWithContextInfo_block_wtContent_wtwbEstbTopServices_wtListMyServicesExperiences_ctl00_wtStartTopService'
@@ -163,8 +180,6 @@ export class GdrfaPortalPage {
 
     await this.page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
     console.log('[Nav] Form page loaded. URL:', this.page.url());
-    await this.page.waitForTimeout(10000);
-    console.log('[Nav] Wait complete.');
   }
 
   private async waitForPageSettle(): Promise<void> {
@@ -278,7 +293,6 @@ export class GdrfaPortalPage {
     await btn.click();
     // Wait for the portal AJAX call to populate SmartInput fields and re-render widgets
     await this.page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-    await this.page.waitForTimeout(2000); // Extra buffer for DOM re-render
 
     // Wait for key passport input fields to appear in the DOM
     console.log('[Form] Waiting for passport fields to load...');
@@ -302,14 +316,14 @@ export class GdrfaPortalPage {
     console.log(`[Form] Filling First Name: "${passport.firstName}"...`);
     await this.editAndFill('inpFirsttNameEn', passport.firstName);
     await this.page.evaluate(() => (window as any).translateInputText?.('inpFirsttNameEn'));
-    await this.page.waitForTimeout(1500);
+    await this.page.waitForTimeout(500);
     console.log('[Form] First Name filled + translated.');
 
     if (passport.middleName) {
       console.log(`[Form] Filling Middle Name: "${passport.middleName}"...`);
       await this.editAndFill('inpMiddleNameEn', passport.middleName);
       await this.page.evaluate(() => (window as any).translateInputText?.('inpMiddleNameEn'));
-      await this.page.waitForTimeout(1500);
+      await this.page.waitForTimeout(500);
       console.log('[Form] Middle Name filled + translated.');
     } else {
       console.log('[Form] No middle name — field left blank.');
@@ -318,7 +332,7 @@ export class GdrfaPortalPage {
     console.log(`[Form] Filling Last Name: "${passport.lastName}"...`);
     await this.editAndFill('inpLastNameEn', passport.lastName);
     await this.page.evaluate(() => (window as any).translateInputText?.('inpLastNameEn'));
-    await this.page.waitForTimeout(1500);
+    await this.page.waitForTimeout(500);
     console.log('[Form] Last Name filled + translated.');
   }
 
@@ -360,7 +374,7 @@ export class GdrfaPortalPage {
     await this.editAndFill('inpApplicantBirthPlaceEn', birthPlace);
     // Click the translate button (same as clicking the 🌐 icon next to the field)
     await this.page.evaluate(() => (window as any).translateInputText('inpApplicantBirthPlaceEn'));
-    await this.page.waitForTimeout(1500);
+    await this.page.waitForTimeout(500);
     console.log('[Form] Birth Place EN filled + translated.');
 
     console.log(`[Form] Setting Gender: "${passport.gender}"...`);
@@ -425,7 +439,7 @@ export class GdrfaPortalPage {
       console.log(`[Form] Filling Place of Issue EN: "${placeOfIssue}"...`);
       await this.editAndFill('inpPassportPlaceIssueEn', placeOfIssue);
       await this.page.evaluate(() => (window as any).translateInputText?.('inpPassportPlaceIssueEn'));
-      await this.page.waitForTimeout(1500);
+      await this.page.waitForTimeout(500);
       console.log('[Form] Place of Issue EN filled + translated.');
     } else {
       console.log('[Form] Place of Issue EN — skipped (empty).');
@@ -455,7 +469,7 @@ export class GdrfaPortalPage {
       console.log(`[Form] Filling Mother Name EN: "${applicant.motherNameEN}"...`);
       await this.editAndFill('inpMotherNameEn', applicant.motherNameEN);
       await this.page.evaluate(() => (window as any).translateInputText?.('inpMotherNameEn'));
-      await this.page.waitForTimeout(1500);
+      await this.page.waitForTimeout(500);
       console.log('[Form] Mother Name EN filled + translated.');
     } else {
       console.log('[Form] Mother Name EN — skipped (empty).');
@@ -508,7 +522,7 @@ export class GdrfaPortalPage {
       const faithContainer = this.page.locator('[data-staticid="cmbApplicantFaith"]')
         .locator('xpath=preceding-sibling::div[contains(@class,"select2-container")]');
       await faithContainer.locator('.select2-choice').click({ timeout: 5000 });
-      await this.page.waitForTimeout(400);
+      await this.page.waitForTimeout(100);
 
       // Remove ReadOnly from the drop panel (separate element appended to <body>)
       await this.page.evaluate(() => {
@@ -518,7 +532,7 @@ export class GdrfaPortalPage {
           drop.querySelectorAll('.ReadOnly').forEach(el => el.classList.remove('ReadOnly'));
         }
       });
-      await this.page.waitForTimeout(200);
+      await this.page.waitForTimeout(100);
 
       // Click the matching option from the results
       const faithOption = this.page.locator('.select2-drop-active .select2-results li').filter({ hasText: applicant.faith }).first();
@@ -789,7 +803,7 @@ export class GdrfaPortalPage {
     const faithContainer = this.page.locator('[data-staticid="cmbApplicantFaith"]')
       .locator('xpath=preceding-sibling::div[contains(@class,"select2-container")]');
     await faithContainer.locator('.select2-choice').click({ timeout: 5000 });
-    await this.page.waitForTimeout(400);
+    await this.page.waitForTimeout(100);
 
     // Remove ReadOnly from the drop panel
     await this.page.evaluate(() => {
@@ -799,7 +813,7 @@ export class GdrfaPortalPage {
         drop.querySelectorAll('.ReadOnly').forEach(el => el.classList.remove('ReadOnly'));
       }
     });
-    await this.page.waitForTimeout(200);
+    await this.page.waitForTimeout(100);
 
     // Click the matching option
     const faithOption = this.page.locator('.select2-drop-active .select2-results li').filter({ hasText: faith }).first();
@@ -1067,7 +1081,7 @@ export class GdrfaPortalPage {
           // Frame may be navigating, skip
         }
       }
-      await this.page.waitForTimeout(500);
+      await this.page.waitForTimeout(250);
     }
     return null;
   }
@@ -1357,7 +1371,7 @@ export class GdrfaPortalPage {
 
     // Type using keyboard (bypasses Playwright visibility check on SmartInput fields)
     await this.page.keyboard.type(searchValue, { delay: 50 });
-    await this.page.waitForTimeout(1500); // Wait for AJAX results
+    await this.page.waitForTimeout(300); // Wait for AJAX results
 
     // Wait for results to appear
     await this.page.waitForFunction(() => {
