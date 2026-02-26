@@ -183,19 +183,61 @@ export class GdrfaPortalPage {
 
   /**
    * Uploads documents using OpenAI for intelligent file-to-slot matching,
-   * then drag-and-drop simulation to upload each file.
+   * then physically clicks the file input and uses sendKeys to upload each file.
    */
   async uploadDocuments(docs: ApplicationDocuments): Promise<void> {
     console.log('[Upload] Starting document upload...');
+
+    // Ensure we're on the default content (not stuck in an iframe from popup handling)
+    try { await this.driver.switchTo().defaultContent(); } catch {}
     await this.waitForPageLoad();
     await this.sleep(3000);
 
-    // List available upload slots on the page
-    const availableSlots = await this.driver.executeScript<string[]>(`
-      return Array.from(document.querySelectorAll('input[type="file"][data-document-type]'))
-        .map(function(el) { return el.getAttribute('data-document-type') || ''; });
-    `);
-    console.log('[Upload] Available slots:', availableSlots);
+    // Log current URL for debugging
+    const uploadUrl = await this.driver.getCurrentUrl();
+    console.log(`[Upload] Current URL: ${uploadUrl}`);
+
+    // Check if upload content is inside an iframe — if so, switch into it
+    let switchedToIframe = false;
+    const fileInputCount = await this.driver.executeScript<number>(
+      `return document.querySelectorAll('input[type="file"]').length;`
+    );
+    if (fileInputCount === 0) {
+      console.log('[Upload] No file inputs in main frame — checking iframes...');
+      const iframes = await this.driver.findElements(By.css('iframe'));
+      for (const iframe of iframes) {
+        try {
+          await this.driver.switchTo().frame(iframe);
+          const count = await this.driver.executeScript<number>(
+            `return document.querySelectorAll('input[type="file"]').length;`
+          );
+          if (count > 0) {
+            console.log(`[Upload] Found ${count} file inputs inside iframe — staying in iframe.`);
+            switchedToIframe = true;
+            break;
+          }
+          await this.driver.switchTo().defaultContent();
+        } catch {
+          try { await this.driver.switchTo().defaultContent(); } catch {}
+        }
+      }
+    } else {
+      console.log(`[Upload] Found ${fileInputCount} file inputs in main frame.`);
+    }
+
+    // Wait for file inputs with data-document-type to render (up to 30s)
+    let availableSlots: string[] = [];
+    for (let waitAttempt = 0; waitAttempt < 10; waitAttempt++) {
+      availableSlots = await this.driver.executeScript<string[]>(`
+        return Array.from(document.querySelectorAll('input[type="file"][data-document-type]'))
+          .map(function(el) { return el.getAttribute('data-document-type') || ''; })
+          .filter(function(s) { return s.length > 0; });
+      `);
+      if (availableSlots.length > 0) break;
+      console.log(`[Upload] Waiting for upload slots to render (${waitAttempt + 1}/10)...`);
+      await this.sleep(3000);
+    }
+    console.log(`[Upload] Available slots (${availableSlots.length}):`, availableSlots);
 
     // Collect all document file paths from the ApplicationDocuments
     const allDocPaths: string[] = [
@@ -216,7 +258,7 @@ export class GdrfaPortalPage {
       if (p) { docsFolder = path.dirname(path.resolve(p)); break; }
     }
 
-    // List ALL files in the documents folder (not just the ones mapped by excel-reader)
+    // List ALL files in the documents folder
     let allFileNames: string[] = [];
     if (docsFolder && fs.existsSync(docsFolder)) {
       allFileNames = fs.readdirSync(docsFolder)
@@ -282,6 +324,25 @@ export class GdrfaPortalPage {
       }
     }
 
+    // If hotel reservation file is missing, upload passport pic in its slot instead
+    const hasHotelDoc = docMap.some(d =>
+      d.file && fs.existsSync(path.resolve(d.file)) &&
+      (d.label.toLowerCase().includes('hotel') || d.label.toLowerCase().includes('place of stay'))
+    );
+    if (!hasHotelDoc) {
+      // Find the passport pic to reuse
+      const passportFile = docs.sponsoredPassportPage1 || docs.passportExternalCoverPage || '';
+      if (passportFile && fs.existsSync(path.resolve(passportFile))) {
+        // Find the hotel slot label from available slots, or use "Others Page 1"
+        const hotelSlot = availableSlots.find(s => s.toLowerCase().includes('hotel') || s.toLowerCase().includes('place of stay'));
+        const label = hotelSlot || 'Others Page 1';
+        // Remove any existing entry for this label so we don't upload twice
+        docMap = docMap.filter(d => d.label !== label);
+        docMap.push({ label, file: passportFile });
+        console.log(`[Upload] No hotel file → uploading passport pic to "${label}"`);
+      }
+    }
+
     // Upload each document
     for (const doc of docMap) {
       if (!doc.file) continue;
@@ -295,6 +356,11 @@ export class GdrfaPortalPage {
 
     console.log('[Upload] All documents sent. Now waiting for Continue button...');
     await this.sleep(2000);
+
+    // Switch back to default content before looking for Continue button
+    if (switchedToIframe) {
+      try { await this.driver.switchTo().defaultContent(); } catch {}
+    }
 
     // The goal: wait for Continue to appear and click it — that means uploads are done
     await this.clickUploadContinue();
@@ -312,279 +378,309 @@ export class GdrfaPortalPage {
   }
 
   /**
-   * Uploads a single document using the drag-and-drop simulation approach:
-   * 1. Finds the drop zone for this document type
-   * 2. Creates a hidden file input via JS
-   * 3. Sends the file path via Selenium sendKeys
-   * 4. Simulates drag-and-drop events (dragenter, dragover, drop) on the drop zone
-   * 5. Waits for the preview to appear
+   * Uploads a single document using Approach 3: DataTransfer + Drop events.
+   *
+   * 1. Find the upload card by data-document-type
+   * 2. Inject a hidden temp <input type="file"> into the DOM
+   * 3. Use Selenium sendKeys() on it to get real File objects
+   * 4. Dispatch dragenter → dragover → drop events on the drop zone
+   *    with a DataTransfer containing those File objects
+   * 5. Also set files on the real input + fire change + call readUrldoc
+   * 6. Wait for preview
    */
   private async uploadSingleDocument(docType: string, filePath: string): Promise<void> {
     console.log(`[Upload] "${docType}" → ${path.basename(filePath)}`);
 
-    // Step 1: Find the upload card/drop zone for this document type
-    const dropZoneIndex = await this.driver.executeScript<number>(`
-      var docType = arguments[0];
-      var fileInputs = document.querySelectorAll('input[type="file"][data-document-type]');
-      var targetIdx = -1;
-      var target = docType.toLowerCase();
+    // Step 1: Find the card by its title span, then get the file input inside.
+    //
+    // DOM per card:
+    //   div[id$="_wtcntDocList"]  ← outer card (dotted border)
+    //     span.Bold → "Title"    ← title text
+    //     div.CardGray.mt-card   ← upload area
+    //       input[type="file"].doc_N[data-document-type="Title"]
+    //       readUrldoc_N() → FileReader → OsNotify()
+    //
+    const inputInfo = await this.driver.executeScript<string>(`
+      var target = arguments[0].toLowerCase().trim();
 
-      // Exact match first
-      for (var i = 0; i < fileInputs.length; i++) {
-        var dt = (fileInputs[i].getAttribute('data-document-type') || '').toLowerCase();
-        if (dt === target) { targetIdx = i; break; }
-      }
-
-      // Fuzzy match
-      if (targetIdx < 0) {
-        for (var i = 0; i < fileInputs.length; i++) {
-          var dt = (fileInputs[i].getAttribute('data-document-type') || '').toLowerCase();
-          if (dt.indexOf(target) >= 0 || target.indexOf(dt) >= 0) { targetIdx = i; break; }
+      // 1. Find the title span matching this docType
+      var spans = document.querySelectorAll('span.Bold');
+      var matched = null;
+      // Exact match
+      for (var i = 0; i < spans.length; i++) {
+        if ((spans[i].textContent || '').trim().toLowerCase() === target) {
+          matched = spans[i]; break;
         }
       }
-
-      // Keyword match
-      if (targetIdx < 0) {
-        var keywords = target.split(/[\\s\\/\\-]+/);
-        for (var i = 0; i < fileInputs.length; i++) {
-          var dt = (fileInputs[i].getAttribute('data-document-type') || '').toLowerCase();
-          var matched = keywords.filter(function(kw) { return kw.length > 3 && dt.indexOf(kw) >= 0; });
-          if (matched.length >= 2) { targetIdx = i; break; }
+      // Contains match
+      if (!matched) {
+        for (var i = 0; i < spans.length; i++) {
+          var t = (spans[i].textContent || '').trim().toLowerCase();
+          if (t.indexOf(target) >= 0 || target.indexOf(t) >= 0) {
+            matched = spans[i]; break;
+          }
         }
       }
+      // Keyword match (handles "Father Passport" → "Parent Passport" etc.)
+      if (!matched) {
+        var keywords = target.split(/[\\s\\-\\/]+/).filter(function(k) { return k.length > 2; });
+        for (var i = 0; i < spans.length; i++) {
+          var t = (spans[i].textContent || '').trim().toLowerCase();
+          var hits = keywords.filter(function(kw) { return t.indexOf(kw) >= 0; });
+          if (hits.length >= 2) { matched = spans[i]; break; }
+        }
+      }
+      // Fallback: match by data-document-type on the file input directly
+      if (!matched) {
+        var fi = document.querySelector('input[type="file"][data-document-type="' + arguments[0] + '"]');
+        if (!fi) {
+          // Try case-insensitive
+          var all = document.querySelectorAll('input[type="file"][data-document-type]');
+          for (var i = 0; i < all.length; i++) {
+            if ((all[i].getAttribute('data-document-type') || '').toLowerCase() === target) { fi = all[i]; break; }
+          }
+        }
+        if (fi) {
+          // Found via data-document-type — go straight to card
+          var outer = fi.closest('[id$="_wtcntDocList"]');
+          if (!outer) {
+            var p = fi.parentElement;
+            for (var d = 0; d < 12 && p; d++) { if (p.id && p.id.indexOf('_wtcntDocList') >= 0) { outer = p; break; } p = p.parentElement; }
+          }
+          if (outer) {
+            outer.scrollIntoView({ block: 'center' });
+            var node = fi;
+            for (var i = 0; i < 10 && node; i++) { if (node.classList) node.classList.remove('ReadOnly'); node = node.parentElement; }
+            fi.removeAttribute('disabled'); fi.removeAttribute('readonly');
+            var m = (fi.className || '').match(/doc_(\\d+)/);
+            return 'OK|' + fi.id + '|' + (m ? m[1] : '') + '|' + (fi.getAttribute('data-document-type') || '');
+          }
+        }
+        return 'ERR:NO_TITLE';
+      }
 
-      if (targetIdx < 0) return -1;
+      // 2. Walk up to the outer card container (div ending with _wtcntDocList)
+      var outer = matched.closest('[id$="_wtcntDocList"]');
+      if (!outer) {
+        // Fallback: walk up until we find a parent containing input[type="file"]
+        var p = matched.parentElement;
+        for (var d = 0; d < 12 && p; d++) {
+          if (p.querySelector('input[type="file"]')) { outer = p; break; }
+          p = p.parentElement;
+        }
+      }
+      if (!outer) return 'ERR:NO_CARD';
 
-      // Scroll the upload card into view
-      var el = fileInputs[targetIdx];
-      var card = el.closest('[class*="uploaderCont"], [class*="upload-btn-wrapper"], [class*="CardSimple"], .ThemeGrid_Width12')
-        || el.parentElement;
-      if (card) card.scrollIntoView({ block: 'center' });
+      // 3. Find the file input inside this specific card
+      var fi = outer.querySelector('input[type="file"]');
+      if (!fi) return 'ERR:NO_INPUT';
 
-      return targetIdx;
+      // 4. Scroll into view + remove ReadOnly
+      outer.scrollIntoView({ block: 'center' });
+      var node = fi;
+      for (var i = 0; i < 10 && node; i++) {
+        if (node.classList) node.classList.remove('ReadOnly');
+        node = node.parentElement;
+      }
+      fi.removeAttribute('disabled');
+      fi.removeAttribute('readonly');
+
+      // 5. Return id + doc_N number
+      var m = (fi.className || '').match(/doc_(\\d+)/);
+      return 'OK|' + fi.id + '|' + (m ? m[1] : '') + '|' + (fi.getAttribute('data-document-type') || '');
     `, docType);
 
-    if (dropZoneIndex < 0) {
-      console.warn(`[Upload] No upload slot found for "${docType}"`);
+    if (inputInfo.startsWith('ERR:')) {
+      console.warn(`[Upload] ${inputInfo} for "${docType}"`);
+      return;
+    }
+
+    const [, fileInputId, docNum, foundType] = inputInfo.split('|');
+    console.log(`[Upload] Found card: type="${foundType}", doc_${docNum}, id=...${fileInputId.slice(-40)}`);
+
+    // Step 2: sendKeys on the real file input, then ALWAYS call readUrldoc_N manually.
+    //
+    //  Why both? sendKeys sets the file and changes the label, but the jQuery
+    //  change handler (osjs('.doc_N').bind('change', readUrldoc_N)) often gets
+    //  detached after the first upload's AJAX partial-page-refresh. So the native
+    //  change event fires but nobody is listening. Calling readUrldoc_N directly
+    //  ensures the FileReader → OsNotify → server postback always happens.
+
+    // Wait for any pending OutSystems AJAX to finish before we start this upload.
+    // OsNotify from a previous upload may still be in-flight. If we fire readUrldoc
+    // while the server is processing the previous postback, the new one gets dropped
+    // because __OSVSTATE is stale.
+    console.log(`[Upload] Waiting for pending AJAX to settle...`);
+    for (let ajaxWait = 0; ajaxWait < 20; ajaxWait++) {
+      const ajaxDone = await this.driver.executeScript<boolean>(`
+        // OutSystems uses jQuery ajax — check if any are pending
+        if (typeof osjs !== 'undefined' && osjs.active > 0) return false;
+        if (typeof jQuery !== 'undefined' && jQuery.active > 0) return false;
+        if (typeof $ !== 'undefined' && $.active > 0) return false;
+        // Also check XMLHttpRequest count via performance entries
+        return true;
+      `);
+      if (ajaxDone) break;
+      await this.sleep(1000);
+    }
+    await this.sleep(1000);
+
+    // Make the file input visible for Selenium
+    await this.driver.executeScript(`
+      var fi = document.getElementById(arguments[0]);
+      if (!fi) return;
+      fi.style.cssText += ';opacity:1!important;position:relative!important;display:block!important;' +
+        'visibility:visible!important;width:200px!important;height:30px!important;z-index:99999!important;';
+    `, fileInputId);
+    await this.sleep(300);
+
+    // sendKeys on the real input — this sets .files and changes the label
+    const realInput = await this.driver.findElement(By.id(fileInputId));
+    try {
+      await realInput.sendKeys(filePath);
+      console.log(`[Upload] sendKeys done`);
+    } catch (e) {
+      console.warn(`[Upload] sendKeys failed: ${e}`);
       return;
     }
     await this.sleep(500);
 
-    // Step 2: Inject a hidden file input, send the file, then simulate drop
-    // This is the JS_DROP_FILES approach from the StackOverflow/GitHub gist
-    await this.driver.executeScript(`
-      var idx = arguments[0];
-      var fileInputs = document.querySelectorAll('input[type="file"][data-document-type]');
-      var originalInput = fileInputs[idx];
+    // Call readUrldoc_N — this triggers FileReader → OsNotify → server postback
+    const callReadUrldoc = async (): Promise<string> => {
+      return await this.driver.executeScript<string>(`
+        var fi = document.getElementById(arguments[0]);
+        var docNum = arguments[1];
+        if (!fi) return 'ERR:input gone';
+        if (!fi.files || !fi.files.length) return 'ERR:no files on input';
 
-      // Find the drop zone — the clickable upload area near this file input
-      var dropZone = originalInput.closest('[class*="uploaderCont"], [class*="upload-btn-wrapper"], [class*="CardSimple"]')
-        || originalInput.parentElement;
+        var log = 'files.length=' + fi.files.length + ', name=' + fi.files[0].name + '\\n';
 
-      // Create a temporary hidden file input for Selenium sendKeys
-      var tempInput = document.createElement('input');
-      tempInput.type = 'file';
-      tempInput.id = '__selenium_drop_input_' + idx;
-      tempInput.style.position = 'fixed';
-      tempInput.style.left = '0';
-      tempInput.style.top = '0';
-      tempInput.style.opacity = '0.001';
-      tempInput.style.width = '100px';
-      tempInput.style.height = '40px';
-      tempInput.style.zIndex = '999999';
-      tempInput.style.display = 'block';
-      document.body.appendChild(tempInput);
-
-      // Store the drop zone element index for later retrieval
-      window.__dropZoneIdx = idx;
-    `, dropZoneIndex);
-    await this.sleep(300);
-
-    // Step 3: Send the file path to the temp hidden input using Selenium
-    const tempInput = await this.driver.findElement(
-      By.css(`#__selenium_drop_input_${dropZoneIndex}`)
-    );
-    await tempInput.sendKeys(filePath);
-    console.log(`[Upload] sendKeys done for "${docType}"`);
-    await this.sleep(500);
-
-    // Step 4: Simulate drag-and-drop events from the temp input to the drop zone
-    // AND also directly set the original file input + trigger its handlers
-    await this.driver.executeScript(`
-      var idx = arguments[0];
-      var tempInput = document.getElementById('__selenium_drop_input_' + idx);
-      if (!tempInput || !tempInput.files || tempInput.files.length === 0) {
-        console.warn('[Upload JS] No file in temp input');
-        return;
-      }
-
-      var file = tempInput.files[0];
-      var fileInputs = document.querySelectorAll('input[type="file"][data-document-type]');
-      var originalInput = fileInputs[idx];
-
-      // Find the drop zone
-      var dropZone = originalInput.closest('[class*="uploaderCont"], [class*="upload-btn-wrapper"], [class*="CardSimple"]')
-        || originalInput.parentElement;
-
-      // ── Approach A: Drag-and-drop simulation ──
-      // Create a DataTransfer with the file
-      try {
-        var dt = new DataTransfer();
-        dt.items.add(file);
-
-        // Fire drag events on the drop zone
-        var dragenterEvt = new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt });
-        var dragoverEvt  = new DragEvent('dragover',  { bubbles: true, cancelable: true, dataTransfer: dt });
-        var dropEvt      = new DragEvent('drop',      { bubbles: true, cancelable: true, dataTransfer: dt });
-
-        dropZone.dispatchEvent(dragenterEvt);
-        dropZone.dispatchEvent(dragoverEvt);
-        dropZone.dispatchEvent(dropEvt);
-      } catch(e) {
-        console.warn('[Upload JS] Drag simulation error:', e);
-      }
-
-      // ── Approach B: Directly set the original file input's files ──
-      try {
-        var dt2 = new DataTransfer();
-        dt2.items.add(file);
-
-        // Remove ReadOnly / hidden from original input
-        originalInput.classList.remove('ReadOnly');
-        originalInput.removeAttribute('disabled');
-        originalInput.removeAttribute('readonly');
-        var p = originalInput.parentElement;
-        for (var i = 0; i < 5 && p; i++) {
-          p.classList.remove('ReadOnly');
-          p = p.parentElement;
+        var fnName = 'readUrldoc_' + docNum;
+        if (typeof window[fnName] === 'function') {
+          try { window[fnName](fi); log += fnName + '() called OK\\n'; }
+          catch(e) { log += fnName + ' error: ' + e + '\\n'; }
+        } else {
+          log += 'WARN: ' + fnName + ' not found on window!\\n';
         }
+        return log;
+      `, fileInputId, docNum);
+    };
 
-        // Set the files property using DataTransfer
-        originalInput.files = dt2.files;
+    const readResult = await callReadUrldoc();
+    console.log(`[Upload] readUrldoc: ${readResult}`);
 
-        // Fire change event
-        originalInput.dispatchEvent(new Event('change', { bubbles: true }));
+    // Wait for FileReader.readAsDataURL to complete (async) before clicking SaveButton.
+    // readUrldoc_N calls reader.readAsDataURL → reader.onload → OsNotify.
+    // OsNotify notifies the OutSystems framework, but the actual server postback
+    // needs the SaveButton to be clicked to submit the form.
+    await this.sleep(2000);
 
-        // Call the site's readUrldoc_XXX handler if it exists
-        var docClass = (originalInput.className || '').match(/doc_(\\d+)/);
-        if (docClass) {
-          var fnName = 'readUrldoc_' + docClass[1];
-          if (typeof window[fnName] === 'function') {
-            try { window[fnName](originalInput); } catch(e) {}
-          }
-        }
-
-        // Also trigger the inline onchange handler
-        if (originalInput.onchange) {
-          try { originalInput.onchange(new Event('change')); } catch(e) {}
-        }
-      } catch(e) {
-        console.warn('[Upload JS] Direct file set error:', e);
+    // Click the SaveButton inside this card to trigger the form submission
+    const saveResult = await this.driver.executeScript<string>(`
+      var fi = document.getElementById(arguments[0]);
+      if (!fi) return 'ERR:input gone';
+      // SaveButton is a sibling of the file input inside FileUpload_Widget
+      var widget = fi.closest('.FileUpload_Widget') || fi.parentElement;
+      var saveBtn = widget ? widget.querySelector('input.SaveButton') : null;
+      if (!saveBtn) {
+        // Try broader search within the card
+        var card = fi.closest('[id$="_wtcntDocList"]') || fi.closest('.CardGray');
+        saveBtn = card ? card.querySelector('input.SaveButton') : null;
       }
+      if (saveBtn) {
+        saveBtn.click();
+        return 'SaveButton clicked: ' + saveBtn.id.slice(-30);
+      }
+      return 'WARN: SaveButton not found';
+    `, fileInputId);
+    console.log(`[Upload] ${saveResult}`);
 
-      // Clean up temp input
-      if (tempInput.parentNode) tempInput.parentNode.removeChild(tempInput);
-    `, dropZoneIndex);
-
-    // Step 5: Brief wait for upload to process, then try direct input fallback too
+    // Step 4: Wait for the upload to process on the server.
+    //         Check THIS card's btnContainer visibility (changes from display:none to visible).
+    //         The old approach (counting global Download links) was broken because all 23
+    //         Download links exist in DOM already (just hidden with display:none).
     console.log(`[Upload] Waiting for "${docType}" to process...`);
-    await this.sleep(3000);
 
-    // Quick check if preview appeared — if not, also try direct input as fallback
-    const hasPreview = await this.driver.executeScript<boolean>(`
-      var idx = arguments[0];
-      var fileInputs = document.querySelectorAll('input[type="file"][data-document-type]');
-      var el = fileInputs[idx];
-      if (!el) return false;
-      var card = el.closest('.ThemeGrid_Width12, [class*="Row"], [class*="uploaderCont"], [class*="CardSimple"]')
-        || el.parentElement.parentElement.parentElement.parentElement;
-      if (!card) return false;
-      var imgs = card.querySelectorAll('img');
-      for (var i = 0; i < imgs.length; i++) {
-        var src = imgs[i].getAttribute('src') || '';
-        if (src && (src.startsWith('data:') || src.startsWith('blob:') || (src.startsWith('http') && !src.includes('placeholder')))) {
-          if (window.getComputedStyle(imgs[i]).display !== 'none') return true;
+    let uploaded = false;
+    let retriedReadUrldoc = false;
+    for (let attempt = 0; attempt < 15; attempt++) {
+      await this.sleep(2000);
+      const status = await this.driver.executeScript<string>(`
+        var fi = document.getElementById(arguments[0]);
+        if (!fi) return 'input_gone';
+        var outer = fi.closest('[id$="_wtcntDocList"]');
+        if (!outer) return 'no_card';
+        var btnCont = outer.querySelector('[id$="_wtbtnContainer"]');
+        var imgCont = outer.querySelector('[id$="_wtimgContainer"]');
+        var label = outer.querySelector('.FileUpload_Label');
+        var labelText = label ? label.textContent.trim() : '';
+        var btnVisible = btnCont && btnCont.style.display !== 'none';
+        var imgVisible = imgCont && imgCont.style.display !== 'none';
+        var labelChanged = labelText !== 'Drag here or click to upload a file' && labelText.length > 0;
+        if (btnVisible || imgVisible) return 'UPLOADED|btn=' + btnVisible + '|img=' + imgVisible + '|label=' + labelText;
+        if (labelChanged) return 'LABEL_CHANGED|' + labelText;
+        return 'waiting|btn=' + (btnCont ? btnCont.style.display : 'N/A') + '|img=' + (imgCont ? imgCont.style.display : 'N/A') + '|label=' + labelText;
+      `, fileInputId);
+
+      if (status.startsWith('UPLOADED')) {
+        console.log(`[Upload] "${docType}" — ${status}`);
+        uploaded = true;
+        break;
+      }
+
+      // If stuck at LABEL_CHANGED after 8s, the OsNotify postback was likely dropped
+      // (stale __OSVSTATE). Retry readUrldoc once after AJAX settles.
+      if (!retriedReadUrldoc && attempt >= 3 && status.startsWith('LABEL_CHANGED')) {
+        retriedReadUrldoc = true;
+        console.log(`[Upload] "${docType}" — retrying readUrldoc (OsNotify may have been dropped)...`);
+        // Wait for any in-flight AJAX to finish first
+        for (let w = 0; w < 10; w++) {
+          const done = await this.driver.executeScript<boolean>(`
+            if (typeof osjs !== 'undefined' && osjs.active > 0) return false;
+            if (typeof jQuery !== 'undefined' && jQuery.active > 0) return false;
+            return true;
+          `);
+          if (done) break;
+          await this.sleep(1000);
         }
-      }
-      var links = card.querySelectorAll('a, button, span');
-      for (var i = 0; i < links.length; i++) {
-        var t = (links[i].textContent || '').trim().toLowerCase();
-        if (t === 'delete' || t === 'download' || t.indexOf('delete') >= 0) return true;
-      }
-      return false;
-    `, dropZoneIndex);
-
-    if (hasPreview) {
-      console.log(`[Upload] "${docType}" — upload confirmed!`);
-    } else {
-      console.log(`[Upload] "${docType}" — no preview yet, trying direct input fallback...`);
-      await this.uploadViaDirectInput(dropZoneIndex, filePath);
-      await this.sleep(3000);
-    }
-
-    await this.sleep(500);
-  }
-
-  /**
-   * Fallback upload: makes the original file input visible and uses sendKeys directly.
-   */
-  private async uploadViaDirectInput(dropZoneIndex: number, filePath: string): Promise<void> {
-    console.log(`[Upload] Trying direct input fallback for slot ${dropZoneIndex}...`);
-
-    await this.driver.executeScript(`
-      var idx = arguments[0];
-      var fileInputs = document.querySelectorAll('input[type="file"][data-document-type]');
-      var el = fileInputs[idx];
-      if (!el) return;
-
-      el.classList.remove('ReadOnly');
-      el.removeAttribute('disabled');
-      el.removeAttribute('readonly');
-      el.style.display = 'block';
-      el.style.visibility = 'visible';
-      el.style.opacity = '1';
-      el.style.width = '200px';
-      el.style.height = '40px';
-      el.style.position = 'relative';
-
-      var p = el.parentElement;
-      for (var i = 0; i < 5 && p; i++) {
-        p.classList.remove('ReadOnly');
-        var cs = window.getComputedStyle(p);
-        if (cs.display === 'none') p.style.display = 'block';
-        if (cs.visibility === 'hidden') p.style.visibility = 'visible';
-        p = p.parentElement;
-      }
-    `, dropZoneIndex);
-    await this.sleep(300);
-
-    // Find the actual file input and sendKeys
-    const fileInputs = await this.driver.findElements(By.css('input[type="file"][data-document-type]'));
-    if (dropZoneIndex < fileInputs.length) {
-      await fileInputs[dropZoneIndex].sendKeys(filePath);
-
-      // Trigger handlers
-      await this.driver.executeScript(`
-        var idx = arguments[0];
-        var fileInputs = document.querySelectorAll('input[type="file"][data-document-type]');
-        var el = fileInputs[idx];
-        if (!el) return;
-
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-
-        var docClass = (el.className || '').match(/doc_(\\d+)/);
-        if (docClass) {
-          var fnName = 'readUrldoc_' + docClass[1];
-          if (typeof window[fnName] === 'function') {
-            try { window[fnName](el); } catch(e) {}
+        await this.sleep(500);
+        const retryResult = await callReadUrldoc();
+        console.log(`[Upload] readUrldoc retry: ${retryResult}`);
+        // Wait for FileReader then click SaveButton again
+        await this.sleep(2000);
+        const retrySave = await this.driver.executeScript<string>(`
+          var fi = document.getElementById(arguments[0]);
+          if (!fi) return 'input gone';
+          var widget = fi.closest('.FileUpload_Widget') || fi.parentElement;
+          var saveBtn = widget ? widget.querySelector('input.SaveButton') : null;
+          if (!saveBtn) {
+            var card = fi.closest('[id$="_wtcntDocList"]') || fi.closest('.CardGray');
+            saveBtn = card ? card.querySelector('input.SaveButton') : null;
           }
-        }
-        if (el.onchange) {
-          try { el.onchange(new Event('change')); } catch(e) {}
-        }
-      `, dropZoneIndex);
-      console.log(`[Upload] Direct input fallback sendKeys done for slot ${dropZoneIndex}.`);
+          if (saveBtn) { saveBtn.click(); return 'SaveButton retry clicked'; }
+          return 'SaveButton not found';
+        `, fileInputId);
+        console.log(`[Upload] ${retrySave}`);
+      }
+
+      console.log(`[Upload] "${docType}" — ${status} (${attempt + 1}/15)`);
     }
+
+    if (!uploaded) {
+      // Take debug screenshot
+      try {
+        const screenshot = await this.driver.takeScreenshot();
+        const ssPath = path.resolve('test-results', `upload-fail-${docType.replace(/[^a-zA-Z0-9]/g, '_')}.png`);
+        fs.mkdirSync(path.dirname(ssPath), { recursive: true });
+        fs.writeFileSync(ssPath, screenshot, 'base64');
+        console.log(`[Upload] Debug screenshot: ${ssPath}`);
+      } catch {}
+      console.warn(`[Upload] "${docType}" — upload did NOT complete after 30s.`);
+    }
+
+    // Wait for page to fully settle before next upload
+    await this.waitForPageLoad();
+    await this.sleep(2000);
   }
 
   /**
