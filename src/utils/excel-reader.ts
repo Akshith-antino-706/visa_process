@@ -107,6 +107,7 @@ export function readApplicationsFromExcel(filePath: string): VisaApplication[] {
  */
 function resolveDocuments(folder: string): ApplicationDocuments {
   const empty: ApplicationDocuments = {
+    documentsFolder:            '',
     sponsoredPassportPage1:   '',
     passportExternalCoverPage: '',
     personalPhoto:             '',
@@ -117,7 +118,9 @@ function resolveDocuments(folder: string): ApplicationDocuments {
   if (!folder) return empty;
 
   const absFolder = path.resolve(folder);
-  if (!fs.existsSync(absFolder)) return empty;
+  if (!fs.existsSync(absFolder)) {
+    return { ...empty, documentsFolder: absFolder };
+  }
 
   const files = fs.readdirSync(absFolder).filter(f => !f.startsWith('.') && f !== 'desktop.ini');
 
@@ -131,11 +134,12 @@ function resolveDocuments(folder: string): ApplicationDocuments {
   };
 
   return {
+    documentsFolder:            absFolder,
     sponsoredPassportPage1:    findAny('Sponsored Passport page 1', 'Sponsored Passport', 'passport page 1', 'passport front'),
     passportExternalCoverPage: findAny('Passport External Cover', 'cover page', 'passport cover'),
     personalPhoto:             findAny('Personal Photo', 'photo'),
     hotelReservationPage1:     findAny('Hotel reservation', 'hotel', 'tenancy contract', 'tenancy', 'accommodation'),
-    returnAirTicketPage1:      findAny('Return air ticket', 'flight ticket', 'air ticket', 'ticket', 'flight'),
+    returnAirTicketPage1:      findAny('Return air ticket', 'flight ticket', 'air ticket', 'indigo', 'boarding pass', 'itinerary', 'ticket', 'flight'),
     hotelReservationPage2:     findAny('Hotel reservation') && files.find(f => f.toLowerCase().includes('hotel') && f.toLowerCase().includes('page 2'))
                                   ? path.join(absFolder, files.find(f => f.toLowerCase().includes('hotel') && f.toLowerCase().includes('page 2'))!)
                                   : undefined,

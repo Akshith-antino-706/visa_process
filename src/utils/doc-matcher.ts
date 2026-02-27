@@ -50,7 +50,7 @@ ${fileNames.map((f, i) => `${i + 1}. ${f}`).join('\n')}
 - "Passport External Cover Page" → match files with "external cover", "cover page", or "passport cover"
 - "Personal Photo" → match files with "personal photo", "photo", "selfie"
 - "Hotel reservation/Place of stay - Page 1" → match files with "hotel", "reservation", "tenancy contract", "accommodation"
-- "Return air ticket - Page 1" → match files with "flight ticket", "air ticket", "ticket", "flight", "boarding pass"
+- "Return air ticket - Page 1" → match files with "flight ticket", "air ticket", "indigo", "boarding pass", "itinerary", "ticket", "flight"
 - "Others Page 1" → use for hotel reservation if no dedicated hotel slot exists
 - "Others Page 2" → use for flight ticket if no dedicated ticket slot exists
 - "Birth Certificate Page 1" → match files with "birth certificate"
@@ -102,11 +102,20 @@ export function matchDocumentsToSlotsLocal(
 
   const rules: Array<{ slotKeywords: string[]; fileKeywords: string[] }> = [
     { slotKeywords: ['sponsored passport page 1'], fileKeywords: ['sponsored passport page 1', 'sponsored passport'] },
-    { slotKeywords: ['sponsored passport page 2'], fileKeywords: ['sponsored passport page 2'] },
+    { slotKeywords: ['sponsored passport page 2'], fileKeywords: ['sponsored passport page 2', 'passport page 2', 'passport back', 'last page'] },
+    { slotKeywords: ['sponsored passport page 3'], fileKeywords: ['sponsored passport page 3', 'passport page 3'] },
+    { slotKeywords: ['sponsored passport page 4'], fileKeywords: ['sponsored passport page 4', 'passport page 4'] },
+    { slotKeywords: ['sponsored passport page 5'], fileKeywords: ['sponsored passport page 5', 'passport page 5'] },
+    { slotKeywords: ['sponsored passport page 2-5'], fileKeywords: ['sponsored passport page 2', 'passport page 2', 'passport back', 'last page'] },
     { slotKeywords: ['passport external cover'], fileKeywords: ['external cover', 'cover page', 'passport cover'] },
     { slotKeywords: ['personal photo'], fileKeywords: ['personal photo', 'photo'] },
     { slotKeywords: ['hotel reservation', 'place of stay'], fileKeywords: ['hotel', 'reservation', 'tenancy contract', 'tenancy', 'accommodation'] },
-    { slotKeywords: ['return air ticket'], fileKeywords: ['flight ticket', 'air ticket', 'ticket', 'flight', 'boarding'] },
+    { slotKeywords: ['return air ticket'], fileKeywords: ['flight ticket', 'air ticket', 'indigo', 'boarding pass', 'itinerary', 'ticket', 'flight', 'boarding'] },
+    { slotKeywords: ['others page 1'], fileKeywords: ['hotel', 'reservation', 'tenancy contract', 'tenancy', 'accommodation', 'stay'] },
+    { slotKeywords: ['others page 2'], fileKeywords: ['flight ticket', 'air ticket', 'indigo', 'boarding pass', 'itinerary', 'ticket', 'flight', 'boarding'] },
+    { slotKeywords: ['others page 3'], fileKeywords: ['birth certificate', 'certificate', 'birth'] },
+    { slotKeywords: ['others page 4'], fileKeywords: ['father passport', 'father visa', 'parent passport', 'sponsor passport', 'father'] },
+    { slotKeywords: ['others page 5'], fileKeywords: ['mother passport', 'mother visa', 'parent visa', 'mother', 'parent'] },
     { slotKeywords: ['birth certificate'], fileKeywords: ['birth certificate'] },
     { slotKeywords: ['father passport'], fileKeywords: ['father passport'] },
     { slotKeywords: ['mother passport'], fileKeywords: ['mother passport'] },

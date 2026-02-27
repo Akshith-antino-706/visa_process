@@ -135,6 +135,9 @@ export interface ContactDetails {
 // File constraints: jpg/pdf/png, max 1000 KB each.
 // IMPORTANT: File names must NOT contain: \ / : * ? " < > |
 export interface ApplicationDocuments {
+  // Source folder for all applicant docs (used for dynamic slot matching)
+  documentsFolder?: string;
+
   // Required (*) slots
   hotelReservationPage1: string;    // "Hotel reservation/Place of stay - Page 1"
   passportExternalCoverPage: string;// "Passport External Cover Page"

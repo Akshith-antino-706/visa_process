@@ -1,6 +1,7 @@
 import { WebDriver, By, until, WebElement, Key } from 'selenium-webdriver';
 import * as path from 'path';
 import * as fs from 'fs';
+import sharp from 'sharp';
 import {
   VisaApplication,
   PassportDetails,
@@ -9,6 +10,96 @@ import {
   ApplicationDocuments,
 } from '../types/application-data';
 import { matchDocumentsToSlots, matchDocumentsToSlotsLocal } from '../utils/doc-matcher';
+// S3 helper available if needed in the future:
+// import { isS3Configured, getPublicUrl } from '../utils/s3-helper';
+
+// ─── File compression ──────────────────────────────────────────────────────
+// GDRFA portal: Allowed .jpg/.pdf/.png, max 1000 KB per file.
+// Compress images that exceed this. PDFs are also checked.
+const MAX_UPLOAD_BYTES = 1000 * 1024; // 1000 KB — GDRFA portal limit
+
+async function compressImageIfNeeded(
+  filePath: string,
+): Promise<{ buffer: Buffer; fileName: string; mimeType: string }> {
+  const resolved = path.resolve(filePath);
+  const originalBuffer = fs.readFileSync(resolved);
+  const ext = path.extname(resolved).toLowerCase();
+  const originalName = path.basename(resolved);
+
+  const isImage = ['.jpg', '.jpeg', '.png', '.webp'].includes(ext);
+  const isPdf = ext === '.pdf';
+
+  // PDFs: can't compress easily, just pass through (warn if too large)
+  if (isPdf) {
+    if (originalBuffer.length > MAX_UPLOAD_BYTES) {
+      console.warn(
+        `[Compress] WARNING: ${originalName} is ${(originalBuffer.length / 1024).toFixed(0)} KB (PDF) — exceeds ${(MAX_UPLOAD_BYTES / 1024).toFixed(0)} KB limit. Portal may reject it.`,
+      );
+    }
+    return { buffer: originalBuffer, fileName: originalName, mimeType: 'application/pdf' };
+  }
+
+  if (!isImage) {
+    return { buffer: originalBuffer, fileName: originalName, mimeType: 'application/octet-stream' };
+  }
+
+  // Image is under limit — pass through
+  if (originalBuffer.length <= MAX_UPLOAD_BYTES) {
+    const mime = ext === '.png' ? 'image/png' : 'image/jpeg';
+    return { buffer: originalBuffer, fileName: originalName, mimeType: mime };
+  }
+
+  console.log(
+    `[Compress] ${originalName}: ${(originalBuffer.length / 1024).toFixed(0)} KB exceeds ${(MAX_UPLOAD_BYTES / 1024).toFixed(0)} KB — compressing...`,
+  );
+
+  // Progressive compression: try decreasing quality until under the limit
+  let quality = 80;
+  let compressed: Buffer = originalBuffer;
+  const metadata = await sharp(originalBuffer).metadata();
+
+  // Cap dimensions — large photos are unnecessary for a visa portal
+  const maxDim = 1200;
+  const needsResize =
+    (metadata.width && metadata.width > maxDim) ||
+    (metadata.height && metadata.height > maxDim);
+
+  while (quality >= 20) {
+    let pipeline = sharp(originalBuffer);
+
+    if (needsResize) {
+      pipeline = pipeline.resize({
+        width: maxDim,
+        height: maxDim,
+        fit: 'inside',
+        withoutEnlargement: true,
+      });
+    }
+
+    // Always output as JPEG for best compression
+    compressed = await pipeline
+      .jpeg({ quality, mozjpeg: true })
+      .toBuffer();
+
+    if (compressed.length <= MAX_UPLOAD_BYTES) break;
+    quality -= 10;
+  }
+
+  // If still too large after quality 20, resize more aggressively
+  if (compressed.length > MAX_UPLOAD_BYTES) {
+    compressed = await sharp(originalBuffer)
+      .resize({ width: 800, height: 800, fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 25, mozjpeg: true })
+      .toBuffer();
+  }
+
+  const compressedName = originalName.replace(/\.\w+$/, '.jpg');
+  console.log(
+    `[Compress] ${originalName}: ${(originalBuffer.length / 1024).toFixed(0)} KB → ${(compressed.length / 1024).toFixed(0)} KB (quality=${quality}, JPEG)`,
+  );
+
+  return { buffer: compressed, fileName: compressedName, mimeType: 'image/jpeg' };
+}
 
 // ─── Page Object ──────────────────────────────────────────────────────────────
 
@@ -42,50 +133,50 @@ export class GdrfaPortalPage {
       // ── Section 1: Visit Details ──
       console.log('\n[Flow] ── Section: Visit Details ──');
       await this.setVisitReason();
-      await this.sleep(1000);
+      await this.sleep(500);
 
       // ── Section 2: Passport Details ──
       console.log('\n[Flow] ── Section: Passport Details ──');
       await this.setPassportType(application.passport.passportType);
-      await this.sleep(800);
+      await this.sleep(500);
       await this.enterPassportNumber(application.passport.passportNumber);
-      await this.sleep(800);
+      await this.sleep(500);
       await this.setNationality(application.passport.currentNationality);
-      await this.sleep(1000);
+      await this.sleep(500);
       await this.setPreviousNationality(
         application.passport.previousNationality ?? application.passport.currentNationality
       );
-      await this.sleep(1000);
+      await this.sleep(500);
       await this.clickSearchDataAndWait();
-      await this.sleep(2000);
+      await this.sleep(1000);
 
       // ── Section 3: Passport Names ──
       console.log('\n[Flow] ── Section: Passport Names ──');
       await this.fillPassportNames(application.passport);
-      await this.sleep(1500);
+      await this.sleep(500);
 
-      // ── Section 4: Passport Dates & Details ──
+      // ── Section 4: Passport Dates & Details (dropdowns first, then text) ──
       console.log('\n[Flow] ── Section: Passport Dates ──');
       await this.fillPassportDetails(application.passport);
-      await this.sleep(1500);
+      await this.sleep(500);
 
       // ── Section 5: Applicant Details ──
       console.log('\n[Flow] ── Section: Applicant Details ──');
       await this.fillApplicantDetails(application.applicant, application.passport.passportIssueCountry);
-      await this.sleep(1500);
+      await this.sleep(500);
 
       // ── Section 6: Contact Details ──
       console.log('\n[Flow] ── Section: Contact Details ──');
       await this.fillContactDetails(application.contact);
-      await this.sleep(1500);
+      await this.sleep(500);
 
       // Retry Faith selection before continuing (dropdown can reset after other fields)
-      await this.retryFaithSelection('Unknown');
-      await this.sleep(1000);
+      await this.retryFaithSelection(application.applicant.faith || 'Unknown');
+      await this.sleep(500);
 
       // Validate all required fields before clicking Continue — retry any empty ones
       await this.validateAndRetryRequiredFields(application);
-      await this.sleep(1000);
+      await this.sleep(500);
 
       await this.clickContinue();
 
@@ -239,31 +330,36 @@ export class GdrfaPortalPage {
     }
     console.log(`[Upload] Available slots (${availableSlots.length}):`, availableSlots);
 
-    // Collect all document file paths from the ApplicationDocuments
-    const allDocPaths: string[] = [
-      docs.sponsoredPassportPage1,
-      docs.passportExternalCoverPage,
-      docs.personalPhoto,
-      docs.hotelReservationPage1,
-      docs.returnAirTicketPage1,
-      docs.hotelReservationPage2 || '',
-      docs.othersPage1 || '',
-      docs.returnAirTicketPage2 || '',
-      ...(docs.sponsoredPassportPages || []),
-    ].filter(Boolean);
-
-    // Get the documents folder from the first valid path
-    let docsFolder = '';
-    for (const p of allDocPaths) {
-      if (p) { docsFolder = path.dirname(path.resolve(p)); break; }
+    // Get the documents folder — prefer the explicit documentsFolder property,
+    // fall back to deriving it from the first valid file path.
+    let docsFolder = docs.documentsFolder ? path.resolve(docs.documentsFolder) : '';
+    if (!docsFolder) {
+      const allDocPaths: string[] = [
+        docs.sponsoredPassportPage1,
+        docs.passportExternalCoverPage,
+        docs.personalPhoto,
+        docs.hotelReservationPage1,
+        docs.returnAirTicketPage1,
+        docs.hotelReservationPage2 || '',
+        docs.othersPage1 || '',
+        docs.returnAirTicketPage2 || '',
+        ...(docs.sponsoredPassportPages || []),
+      ].filter(Boolean);
+      for (const p of allDocPaths) {
+        if (p) { docsFolder = path.dirname(path.resolve(p)); break; }
+      }
     }
+    console.log(`[Upload] Documents folder: ${docsFolder || '(empty)'}`);
+    console.log(`[Upload] Folder exists: ${docsFolder ? fs.existsSync(docsFolder) : false}`);
 
     // List ALL files in the documents folder
     let allFileNames: string[] = [];
     if (docsFolder && fs.existsSync(docsFolder)) {
       allFileNames = fs.readdirSync(docsFolder)
         .filter(f => !f.startsWith('.') && f !== 'desktop.ini');
-      console.log(`[Upload] Files in folder: ${allFileNames.join(', ')}`);
+      console.log(`[Upload] Files in folder (${allFileNames.length}): ${allFileNames.join(', ')}`);
+    } else {
+      console.warn(`[Upload] Documents folder not found or empty — file matching will fail!`);
     }
 
     // Use OpenAI to intelligently match files to upload slots
@@ -343,16 +439,29 @@ export class GdrfaPortalPage {
       }
     }
 
-    // Upload each document
+    // Log the final document map before uploading
+    console.log(`[Upload] Document map (${docMap.length} entries):`);
     for (const doc of docMap) {
-      if (!doc.file) continue;
+      const exists = doc.file ? fs.existsSync(path.resolve(doc.file)) : false;
+      console.log(`  "${doc.label}" → ${doc.file || '(empty)'} ${exists ? '✓' : '✗ MISSING'}`);
+    }
+
+    // Upload each document
+    let uploadCount = 0;
+    for (const doc of docMap) {
+      if (!doc.file) {
+        console.warn(`[Upload] Skipping "${doc.label}" — no file path`);
+        continue;
+      }
       const filePath = path.resolve(doc.file);
       if (!fs.existsSync(filePath)) {
         console.warn(`[Upload] File not found: ${filePath}`);
         continue;
       }
       await this.uploadSingleDocument(doc.label, filePath);
+      uploadCount++;
     }
+    console.log(`[Upload] Uploaded ${uploadCount}/${docMap.length} documents.`);
 
     console.log('[Upload] All documents sent. Now waiting for Continue button...');
     await this.sleep(2000);
@@ -378,15 +487,24 @@ export class GdrfaPortalPage {
   }
 
   /**
-   * Uploads a single document using Approach 3: DataTransfer + Drop events.
+   * Uploads a single document using a 3-strategy cascade:
    *
-   * 1. Find the upload card by data-document-type
-   * 2. Inject a hidden temp <input type="file"> into the DOM
-   * 3. Use Selenium sendKeys() on it to get real File objects
-   * 4. Dispatch dragenter → dragover → drop events on the drop zone
-   *    with a DataTransfer containing those File objects
-   * 5. Also set files on the real input + fire change + call readUrldoc
-   * 6. Wait for preview
+   * Strategy 1 (Primary): S3 fetch → DataTransfer injection
+   *   - fetch(presignedUrl) inside the browser → Blob → File → DataTransfer → input.files
+   *   - Zero filesystem dependency. File goes S3 → browser memory → input.
+   *   - Creates a REAL File object indistinguishable from user-selected file.
+   *
+   * Strategy 2 (Fallback): sendKeys + DataTransfer re-injection
+   *   - sendKeys sets .files, then we read the file with FileReader,
+   *     re-create it via DataTransfer to ensure proper File objects.
+   *
+   * Strategy 3 (Last resort): sendKeys only
+   *   - Classic sendKeys on the visible file input.
+   *
+   * After files are set (by any strategy):
+   *   → dispatch change event (jQuery + native)
+   *   → call readUrldoc_N with correct this context
+   *   → wait for OsNotify AJAX postback (NOT SaveButton — it causes page navigation)
    */
   private async uploadSingleDocument(docType: string, filePath: string): Promise<void> {
     console.log(`[Upload] "${docType}" → ${path.basename(filePath)}`);
@@ -525,27 +643,94 @@ export class GdrfaPortalPage {
     }
     await this.sleep(1000);
 
-    // Make the file input visible for Selenium
-    await this.driver.executeScript(`
-      var fi = document.getElementById(arguments[0]);
-      if (!fi) return;
-      fi.style.cssText += ';opacity:1!important;position:relative!important;display:block!important;' +
-        'visibility:visible!important;width:200px!important;height:30px!important;z-index:99999!important;';
-    `, fileInputId);
-    await this.sleep(300);
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 2: Inject file into the input via base64 → DataTransfer
+    // ═══════════════════════════════════════════════════════════════════════════
+    //
+    // How it works:
+    //   1. Node reads the local file into a base64 string
+    //   2. Browser decodes base64 → Uint8Array → File object
+    //   3. DataTransfer API sets input.files = [File]
+    //
+    // Why this is best:
+    //   - Bypasses sendKeys entirely (no event-firing issues)
+    //   - Creates a REAL File object identical to user-selected files
+    //   - No filesystem path sent to the browser (works with any input state)
+    //   - No S3/network dependency
+    //   - Works even when the input is hidden/readonly/disabled
 
-    // sendKeys on the real input — this sets .files and changes the label
-    const realInput = await this.driver.findElement(By.id(fileInputId));
-    try {
-      await realInput.sendKeys(filePath);
-      console.log(`[Upload] sendKeys done`);
-    } catch (e) {
-      console.warn(`[Upload] sendKeys failed: ${e}`);
+    console.log(`[Upload] Reading file (compressing if needed)...`);
+    const { buffer: fileBuffer, fileName, mimeType } = await compressImageIfNeeded(filePath);
+    const base64 = fileBuffer.toString('base64');
+    console.log(`[Upload] File: ${fileName} (${(fileBuffer.length / 1024).toFixed(1)} KB, ${mimeType})`);
+
+    const injectResult = await this.driver.executeScript<string>(`
+      var inputId = arguments[0];
+      var b64     = arguments[1];
+      var fname   = arguments[2];
+      var mime    = arguments[3];
+
+      var fi = document.getElementById(inputId);
+      if (!fi) return 'ERR:input gone';
+
+      // Decode base64 → ArrayBuffer → File
+      var binary = atob(b64);
+      var bytes = new Uint8Array(binary.length);
+      for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+      // Create a real File object and inject via DataTransfer
+      var file = new File([bytes.buffer], fname, { type: mime, lastModified: Date.now() });
+      var dt = new DataTransfer();
+      dt.items.add(file);
+      fi.files = dt.files;
+
+      if (!fi.files || !fi.files.length) return 'ERR:files not set after DataTransfer';
+      return 'OK|files=' + fi.files.length + '|name=' + fi.files[0].name + '|size=' + fi.files[0].size;
+    `, fileInputId, base64, fileName, mimeType);
+
+    console.log(`[Upload] DataTransfer inject: ${injectResult}`);
+    if (!injectResult.startsWith('OK')) {
+      console.warn(`[Upload] File injection failed: ${injectResult} — skipping "${docType}"`);
       return;
     }
     await this.sleep(500);
 
-    // Call readUrldoc_N — this triggers FileReader → OsNotify → server postback
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STEP 3: Trigger the upload — change event + readUrldoc_N + OsNotify
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    // 3a. Dispatch change event (jQuery + native) to fire any bound handlers
+    const changeResult = await this.driver.executeScript<string>(`
+      var fi = document.getElementById(arguments[0]);
+      if (!fi) return 'ERR:input gone';
+      if (!fi.files || !fi.files.length) return 'ERR:no files';
+      var log = 'files=' + fi.files.length + ', name=' + fi.files[0].name + '\\n';
+
+      // jQuery/osjs trigger — fires handlers attached via .bind()/.on()
+      try {
+        if (typeof osjs !== 'undefined' && osjs(fi).trigger) {
+          osjs(fi).trigger('change');
+          log += 'osjs.trigger(change) OK\\n';
+        } else if (typeof jQuery !== 'undefined') {
+          jQuery(fi).trigger('change');
+          log += 'jQuery.trigger(change) OK\\n';
+        }
+      } catch(e) { log += 'jq trigger err: ' + e + '\\n'; }
+
+      // Native change event — fires addEventListener handlers
+      try {
+        fi.dispatchEvent(new Event('change', { bubbles: true }));
+        log += 'native change OK\\n';
+      } catch(e) { log += 'native change err: ' + e + '\\n'; }
+
+      return log;
+    `, fileInputId);
+    console.log(`[Upload] change event: ${changeResult}`);
+    await this.sleep(1500);
+
+    // 3b. ALWAYS call readUrldoc_N manually as the reliable upload trigger.
+    //     The change handler may be detached after prior AJAX refreshes.
+    //     Calling it twice is harmless; NOT calling it is fatal.
     const callReadUrldoc = async (): Promise<string> => {
       return await this.driver.executeScript<string>(`
         var fi = document.getElementById(arguments[0]);
@@ -557,43 +742,54 @@ export class GdrfaPortalPage {
 
         var fnName = 'readUrldoc_' + docNum;
         if (typeof window[fnName] === 'function') {
-          try { window[fnName](fi); log += fnName + '() called OK\\n'; }
+          // .call(fi, fi) → 'this' = input element, matching jQuery's behavior
+          try { window[fnName].call(fi, fi); log += fnName + '() called OK\\n'; }
           catch(e) { log += fnName + ' error: ' + e + '\\n'; }
         } else {
-          log += 'WARN: ' + fnName + ' not found on window!\\n';
+          log += 'WARN: ' + fnName + ' not found — inline FileReader fallback\\n';
+          // Manual fallback: FileReader → base64 → OsNotify
+          try {
+            var reader = new FileReader();
+            reader.onload = function(ev) {
+              var base64 = ev.target.result;
+              var outer = fi.closest('[id$="_wtcntDocList"]') || fi.parentElement;
+              if (outer) {
+                var img = outer.querySelector('img');
+                if (img) img.src = base64;
+                var imgCont = outer.querySelector('[id$="_wtimgContainer"]');
+                if (imgCont) imgCont.style.display = '';
+              }
+              if (typeof OsNotify === 'function') {
+                try { OsNotify(fi.id, base64); } catch(e2) {}
+              }
+            };
+            reader.readAsDataURL(fi.files[0]);
+            log += 'inline FileReader started\\n';
+          } catch(e) { log += 'inline FileReader error: ' + e + '\\n'; }
         }
         return log;
       `, fileInputId, docNum);
     };
 
+    console.log(`[Upload] Calling readUrldoc_${docNum} → FileReader → OsNotify...`);
     const readResult = await callReadUrldoc();
     console.log(`[Upload] readUrldoc: ${readResult}`);
 
-    // Wait for FileReader.readAsDataURL to complete (async) before clicking SaveButton.
-    // readUrldoc_N calls reader.readAsDataURL → reader.onload → OsNotify.
-    // OsNotify notifies the OutSystems framework, but the actual server postback
-    // needs the SaveButton to be clicked to submit the form.
-    await this.sleep(2000);
-
-    // Click the SaveButton inside this card to trigger the form submission
-    const saveResult = await this.driver.executeScript<string>(`
-      var fi = document.getElementById(arguments[0]);
-      if (!fi) return 'ERR:input gone';
-      // SaveButton is a sibling of the file input inside FileUpload_Widget
-      var widget = fi.closest('.FileUpload_Widget') || fi.parentElement;
-      var saveBtn = widget ? widget.querySelector('input.SaveButton') : null;
-      if (!saveBtn) {
-        // Try broader search within the card
-        var card = fi.closest('[id$="_wtcntDocList"]') || fi.closest('.CardGray');
-        saveBtn = card ? card.querySelector('input.SaveButton') : null;
-      }
-      if (saveBtn) {
-        saveBtn.click();
-        return 'SaveButton clicked: ' + saveBtn.id.slice(-30);
-      }
-      return 'WARN: SaveButton not found';
-    `, fileInputId);
-    console.log(`[Upload] ${saveResult}`);
+    // 3c. Wait for FileReader + OsNotify AJAX postback to complete.
+    //     DO NOT click SaveButton — it triggers a full page POST that navigates
+    //     to Application_UploadDocuments.aspx (ERR_ACCESS_DENIED).
+    await this.sleep(3000);
+    console.log(`[Upload] Waiting for OsNotify AJAX postback...`);
+    for (let sw = 0; sw < 15; sw++) {
+      const settled = await this.driver.executeScript<boolean>(`
+        if (typeof osjs !== 'undefined' && osjs.active > 0) return false;
+        if (typeof jQuery !== 'undefined' && jQuery.active > 0) return false;
+        if (typeof $ !== 'undefined' && $.active > 0) return false;
+        return true;
+      `);
+      if (settled) break;
+      await this.sleep(1000);
+    }
 
     // Step 4: Wait for the upload to process on the server.
     //         Check THIS card's btnContainer visibility (changes from display:none to visible).
@@ -606,10 +802,38 @@ export class GdrfaPortalPage {
     for (let attempt = 0; attempt < 15; attempt++) {
       await this.sleep(2000);
       const status = await this.driver.executeScript<string>(`
+        // Try finding the card by the original element ID first
         var fi = document.getElementById(arguments[0]);
-        if (!fi) return 'input_gone';
-        var outer = fi.closest('[id$="_wtcntDocList"]');
-        if (!outer) return 'no_card';
+        var outer = null;
+        if (fi) {
+          outer = fi.closest('[id$="_wtcntDocList"]');
+        }
+        // If the old ID is gone (OsNotify re-rendered the DOM), find the card
+        // by data-document-type instead — the document type text survives re-renders.
+        if (!outer) {
+          var target = arguments[1].toLowerCase().trim();
+          // Try finding by data-document-type attribute on the new file input
+          var allInputs = document.querySelectorAll('input[type="file"][data-document-type]');
+          for (var i = 0; i < allInputs.length; i++) {
+            var dt = (allInputs[i].getAttribute('data-document-type') || '').toLowerCase().trim();
+            if (dt === target || dt.indexOf(target) >= 0 || target.indexOf(dt) >= 0) {
+              outer = allInputs[i].closest('[id$="_wtcntDocList"]');
+              if (outer) break;
+            }
+          }
+          // Also try by span.Bold text
+          if (!outer) {
+            var spans = document.querySelectorAll('span.Bold');
+            for (var i = 0; i < spans.length; i++) {
+              var t = (spans[i].textContent || '').trim().toLowerCase();
+              if (t === target || t.indexOf(target) >= 0 || target.indexOf(t) >= 0) {
+                outer = spans[i].closest('[id$="_wtcntDocList"]');
+                if (outer) break;
+              }
+            }
+          }
+        }
+        if (!outer) return 'input_gone';
         var btnCont = outer.querySelector('[id$="_wtbtnContainer"]');
         var imgCont = outer.querySelector('[id$="_wtimgContainer"]');
         var label = outer.querySelector('.FileUpload_Label');
@@ -620,7 +844,7 @@ export class GdrfaPortalPage {
         if (btnVisible || imgVisible) return 'UPLOADED|btn=' + btnVisible + '|img=' + imgVisible + '|label=' + labelText;
         if (labelChanged) return 'LABEL_CHANGED|' + labelText;
         return 'waiting|btn=' + (btnCont ? btnCont.style.display : 'N/A') + '|img=' + (imgCont ? imgCont.style.display : 'N/A') + '|label=' + labelText;
-      `, fileInputId);
+      `, fileInputId, docType);
 
       if (status.startsWith('UPLOADED')) {
         console.log(`[Upload] "${docType}" — ${status}`);
@@ -629,10 +853,10 @@ export class GdrfaPortalPage {
       }
 
       // If stuck at LABEL_CHANGED after 8s, the OsNotify postback was likely dropped
-      // (stale __OSVSTATE). Retry readUrldoc once after AJAX settles.
+      // (stale __OSVSTATE). Retry: re-dispatch change event + readUrldoc fallback.
       if (!retriedReadUrldoc && attempt >= 3 && status.startsWith('LABEL_CHANGED')) {
         retriedReadUrldoc = true;
-        console.log(`[Upload] "${docType}" — retrying readUrldoc (OsNotify may have been dropped)...`);
+        console.log(`[Upload] "${docType}" — retrying (OsNotify may have been dropped)...`);
         // Wait for any in-flight AJAX to finish first
         for (let w = 0; w < 10; w++) {
           const done = await this.driver.executeScript<boolean>(`
@@ -644,23 +868,48 @@ export class GdrfaPortalPage {
           await this.sleep(1000);
         }
         await this.sleep(500);
+
+        // Re-dispatch change event first (handler may have been re-attached after AJAX refresh)
+        await this.driver.executeScript(`
+          var fi = document.getElementById(arguments[0]);
+          if (!fi || !fi.files || !fi.files.length) return;
+          try { if (typeof osjs !== 'undefined') osjs(fi).trigger('change'); } catch(e) {}
+          try { fi.dispatchEvent(new Event('change', { bubbles: true })); } catch(e) {}
+        `, fileInputId);
+        await this.sleep(1500);
+
+        // Check if the change event retry worked
+        const retryWorked = await this.driver.executeScript<boolean>(`
+          var fi = document.getElementById(arguments[0]);
+          if (!fi) return false;
+          var outer = fi.closest('[id$="_wtcntDocList"]');
+          if (!outer) return false;
+          var btnCont = outer.querySelector('[id$="_wtbtnContainer"]');
+          var imgCont = outer.querySelector('[id$="_wtimgContainer"]');
+          return (btnCont && btnCont.style.display !== 'none') || (imgCont && imgCont.style.display !== 'none');
+        `, fileInputId);
+
+        if (retryWorked) {
+          console.log(`[Upload] "${docType}" — change event retry succeeded`);
+          continue;
+        }
+
+        // Still no preview — call readUrldoc_N manually as last resort
         const retryResult = await callReadUrldoc();
         console.log(`[Upload] readUrldoc retry: ${retryResult}`);
-        // Wait for FileReader then click SaveButton again
-        await this.sleep(2000);
-        const retrySave = await this.driver.executeScript<string>(`
-          var fi = document.getElementById(arguments[0]);
-          if (!fi) return 'input gone';
-          var widget = fi.closest('.FileUpload_Widget') || fi.parentElement;
-          var saveBtn = widget ? widget.querySelector('input.SaveButton') : null;
-          if (!saveBtn) {
-            var card = fi.closest('[id$="_wtcntDocList"]') || fi.closest('.CardGray');
-            saveBtn = card ? card.querySelector('input.SaveButton') : null;
-          }
-          if (saveBtn) { saveBtn.click(); return 'SaveButton retry clicked'; }
-          return 'SaveButton not found';
-        `, fileInputId);
-        console.log(`[Upload] ${retrySave}`);
+        // Wait for FileReader + OsNotify AJAX postback to complete
+        await this.sleep(3000);
+        for (let sw2 = 0; sw2 < 10; sw2++) {
+          const settled = await this.driver.executeScript<boolean>(`
+            if (typeof osjs !== 'undefined' && osjs.active > 0) return false;
+            if (typeof jQuery !== 'undefined' && jQuery.active > 0) return false;
+            return true;
+          `);
+          if (settled) break;
+          await this.sleep(1000);
+        }
+        // Do NOT click SaveButton — it triggers a full page POST that navigates away.
+        // OsNotify's AJAX postback handles the upload entirely.
       }
 
       console.log(`[Upload] "${docType}" — ${status} (${attempt + 1}/15)`);
@@ -831,13 +1080,54 @@ export class GdrfaPortalPage {
       await firstService.click();
     }
 
+    // Wait for actual form page (EntryPermitTourism.aspx) to load — not just the EstablishmentDetail page
+    console.log('[Nav] Waiting for form page to load...');
+    try {
+      await this.waitForUrlContains('EntryPermit', 30000);
+    } catch {
+      // Some portal versions load the form on the same page via AJAX
+      console.warn('[Nav] URL did not change to EntryPermit — checking if form loaded on current page...');
+    }
     await this.waitForPageLoad();
+    await this.sleep(2000);
+
+    // Verify the actual form is present by checking for known form elements
+    const formReady = await this.waitForFormElements(30000);
+    if (!formReady) {
+      throw new Error('[Nav] Form page did not load — no form elements found after 30s.');
+    }
+
     const currentUrl = await this.driver.getCurrentUrl();
     console.log('[Nav] Form page loaded. URL:', currentUrl);
   }
 
+  /**
+   * Waits until at least some expected form elements are present (Select2 dropdowns, form sections).
+   */
+  private async waitForFormElements(timeout: number): Promise<boolean> {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const found = await this.driver.executeScript<boolean>(`
+        // Check for Select2 containers (dropdowns for Passport Type, Nationality, etc.)
+        var s2 = document.querySelectorAll('.select2-container');
+        if (s2.length >= 3) return true;
+        // Check for known form sections
+        var labels = document.querySelectorAll('label');
+        for (var i = 0; i < labels.length; i++) {
+          var t = (labels[i].textContent || '').toLowerCase();
+          if (t.indexOf('passport type') >= 0 || t.indexOf('passport number') >= 0) return true;
+        }
+        return false;
+      `);
+      if (found) return true;
+      await this.sleep(1000);
+    }
+    return false;
+  }
+
   private async waitForPageSettle(): Promise<void> {
     await this.waitForPageLoad();
+    await this.sleep(500);
   }
 
   // ── Physical Select2 click helper ──────────────────────────────────────────
@@ -852,13 +1142,65 @@ export class GdrfaPortalPage {
    * @returns true if successfully selected
    */
   private async clickSelect2ByLabel(labelText: string, optionText: string): Promise<boolean> {
-    // Find all Select2 containers and match by nearby label text
+    // Step 1: Find the Select2 container near the label, remove ReadOnly, and return its index.
+    // Uses two strategies: (A) find <label> by text → find associated <select> → find its Select2,
+    // (B) walk up from each Select2 container checking siblings for label text.
     const s2Index = await this.driver.executeScript<number>(`
       var label = arguments[0];
+      var normalLabel = label.replace(/[\\s*]/g, '').toLowerCase();
+
+      // ── Strategy A: Find <label> element → associated <select> → its Select2 ──
+      var lbls = Array.from(document.querySelectorAll('label'));
+      for (var li = 0; li < lbls.length; li++) {
+        var lbl = lbls[li];
+        if (lbl.classList.contains('select2-offscreen')) continue;
+        var lblText = (lbl.textContent || '').replace(/[\\s*]/g, '').toLowerCase();
+        if (lblText !== normalLabel && lblText.indexOf(normalLabel) < 0) continue;
+
+        // Found the label — now find associated select
+        var sel = null;
+        if (lbl.htmlFor) {
+          var el = document.getElementById(lbl.htmlFor);
+          if (el instanceof HTMLSelectElement) sel = el;
+          else if (el) {
+            var row = el.closest('.ThemeGrid_Width6,.ThemeGrid_Width12,.FormTitle');
+            if (row && row.parentElement) sel = row.parentElement.querySelector('select');
+            if (!sel && el.parentElement) sel = el.parentElement.querySelector('select');
+          }
+        }
+        // Walk up from label to find a nearby select
+        if (!sel) {
+          var row = lbl.closest('.ThemeGrid_Width6,.ThemeGrid_Width12,.FormTitle');
+          if (row && row.parentElement) sel = row.parentElement.querySelector('select');
+          if (!sel && row && row.nextElementSibling) sel = row.nextElementSibling.querySelector('select');
+        }
+        if (!sel) continue;
+
+        // Find the Select2 container for this select
+        var s2 = sel.previousElementSibling;
+        if (!s2 || !s2.classList.contains('select2-container')) {
+          s2 = document.getElementById('s2id_' + sel.id);
+        }
+        if (!s2 || !s2.classList.contains('select2-container')) continue;
+
+        // Get index among all Select2 containers
+        var allS2 = document.querySelectorAll('.select2-container');
+        for (var idx = 0; idx < allS2.length; idx++) {
+          if (allS2[idx] === s2) {
+            // Remove ReadOnly
+            s2.classList.remove('ReadOnly');
+            s2.querySelectorAll('.ReadOnly').forEach(function(el) { el.classList.remove('ReadOnly'); });
+            var p = s2.parentElement;
+            for (var k = 0; k < 5 && p; k++) { p.classList.remove('ReadOnly'); p = p.parentElement; }
+            return idx;
+          }
+        }
+      }
+
+      // ── Strategy B: Walk up from each Select2 container checking siblings ──
       var s2s = document.querySelectorAll('.select2-container');
       for (var i = 0; i < s2s.length; i++) {
         var s2 = s2s[i];
-        // Check the text content of parent containers for the label
         var parent = s2.parentElement;
         for (var depth = 0; depth < 8 && parent; depth++) {
           var siblings = parent.children;
@@ -866,8 +1208,7 @@ export class GdrfaPortalPage {
             var sib = siblings[j];
             if (sib === s2 || sib.querySelector('.select2-container')) continue;
             var text = (sib.textContent || '').trim();
-            if (text.length < 50 && text.replace(/[\\s*]/g, '').toLowerCase().indexOf(label.replace(/[\\s*]/g, '').toLowerCase()) >= 0) {
-              // Remove ReadOnly
+            if (text.length < 80 && text.replace(/[\\s*]/g, '').toLowerCase().indexOf(normalLabel) >= 0) {
               s2.classList.remove('ReadOnly');
               s2.querySelectorAll('.ReadOnly').forEach(function(el) { el.classList.remove('ReadOnly'); });
               var p = s2.parentElement;
@@ -878,6 +1219,7 @@ export class GdrfaPortalPage {
           parent = parent.parentElement;
         }
       }
+
       return -1;
     `, labelText);
 
@@ -900,47 +1242,178 @@ export class GdrfaPortalPage {
       }
     } catch {}
 
-    // Scroll and click the dropdown open
+    // ── Step 2: Scroll into view and click the dropdown open ──
     await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', container);
-    await this.sleep(500);
+    await this.sleep(300);
 
+    // Use Selenium's real click — Select2 needs real browser events
     try {
-      const choiceLink = await container.findElement(By.css('.select2-choice, a'));
+      const choiceLink = await container.findElement(By.css('.select2-choice, a.select2-choice'));
       await choiceLink.click();
     } catch {
       await container.click();
     }
-    await this.sleep(2000);
+    await this.sleep(800);
 
-    // Find and click the option
-    const results = await this.driver.findElements(
-      By.css('.select2-drop-active .select2-results li')
-    );
-    console.log(`[Select2] "${labelText}" dropdown: ${results.length} options.`);
+    // ── Step 3: Unlock the dropdown panel (ReadOnly, pencil icon, search input) ──
+    await this.driver.executeScript(`
+      var drop = document.querySelector('.select2-drop-active');
+      if (!drop) return;
+      drop.classList.remove('ReadOnly');
+      drop.querySelectorAll('*').forEach(function(el) { el.classList.remove('ReadOnly'); });
 
-    for (const li of results) {
-      const text = await li.getText().catch(() => '');
-      if (text.toUpperCase().includes(optionText.toUpperCase())) {
-        await li.click();
-        console.log(`[Select2] "${labelText}" → "${text.trim()}".`);
+      // Click pencil/edit icon if present (OutSystems ReadOnly pattern)
+      var pencil = drop.querySelector('.FormEditPencil');
+      if (pencil) pencil.click();
+
+      // Unlock the search input
+      var input = drop.querySelector('.select2-input');
+      if (input) {
+        input.removeAttribute('readonly');
+        input.removeAttribute('disabled');
+        input.classList.remove('ReadOnly');
+        input.style.display = '';
+        input.style.visibility = 'visible';
+      }
+    `);
+    await this.sleep(300);
+
+    // ── Step 4: Check if dropdown has a search input — type with real Selenium keys ──
+    let searchInput: WebElement | null = null;
+    try {
+      searchInput = await this.driver.findElement(
+        By.css('.select2-drop-active .select2-input')
+      );
+    } catch {}
+
+    if (searchInput) {
+      // Focus and clear the input, then type character by character (triggers Select2's AJAX)
+      await searchInput.click();
+      await this.sleep(200);
+      await searchInput.clear();
+      for (const char of optionText) {
+        await searchInput.sendKeys(char);
+        await this.sleep(60);
+      }
+
+      // Wait for AJAX results to load
+      console.log(`[Select2] "${labelText}" — typed "${optionText}", waiting for results...`);
+      await this.waitForCondition(async () => {
+        return this.driver.executeScript<boolean>(`
+          var results = document.querySelectorAll('.select2-drop-active .select2-results li.select2-result');
+          if (results.length === 0) return false;
+          // Make sure it's not the "Searching..." or "No results" message
+          var text = results[0].textContent.toLowerCase();
+          return text.indexOf('searching') < 0 && text.indexOf('no ') !== 0;
+        `);
+      }, 10000).catch(() => {
+        console.warn(`[Select2] "${labelText}" — no AJAX results after 10s.`);
+      });
+      await this.sleep(500);
+    }
+
+    // ── Step 5: Find and click the best matching result ──
+    // First identify which result to click via JS (fast), then click it with Selenium (reliable)
+    const resultIndex = await this.driver.executeScript<number>(`
+      var search = arguments[0].toUpperCase();
+      var results = document.querySelectorAll('.select2-drop-active .select2-results li.select2-result');
+      if (results.length === 0) results = document.querySelectorAll('.select2-drop-active .select2-results li');
+      if (results.length === 0) return -1;
+
+      // Pass 1: exact match (strip number prefix like "349 - ")
+      for (var i = 0; i < results.length; i++) {
+        var t = results[i].textContent.replace(/^\\d+\\s*-\\s*/, '').trim();
+        if (t.toUpperCase() === search) return i;
+      }
+      // Pass 2: starts-with (stripped)
+      for (var i = 0; i < results.length; i++) {
+        var t = results[i].textContent.replace(/^\\d+\\s*-\\s*/, '').trim();
+        if (t.toUpperCase().indexOf(search) === 0) return i;
+      }
+      // Pass 3: contains
+      for (var i = 0; i < results.length; i++) {
+        if (results[i].textContent.toUpperCase().indexOf(search) >= 0) return i;
+      }
+      // Pass 4: if only one result and it's not "no results", take it
+      if (results.length === 1) {
+        var t = results[0].textContent.toLowerCase();
+        if (t.indexOf('no ') !== 0) return 0;
+      }
+      return -1;
+    `, optionText);
+
+    if (resultIndex >= 0) {
+      // Click with Selenium's real click (Select2 needs real browser events)
+      const resultElements = await this.driver.findElements(
+        By.css('.select2-drop-active .select2-results li.select2-result, .select2-drop-active .select2-results li')
+      );
+      if (resultIndex < resultElements.length) {
+        const matchedText = await resultElements[resultIndex].getText().catch(() => '');
+        console.log(`[Select2] "${labelText}" — clicking result: "${matchedText.trim()}"...`);
+        await resultElements[resultIndex].click();
+        await this.sleep(500);
+
+        // Verify dropdown closed — if not, force selection via mousedown/mouseup/click
+        const stillOpen = await this.driver.executeScript<boolean>(
+          `return !!document.querySelector('.select2-drop-active');`
+        );
+        if (stillOpen) {
+          console.log(`[Select2] "${labelText}" — dropdown still open, using JS mouse events...`);
+          await this.driver.executeScript(`
+            var results = document.querySelectorAll('.select2-drop-active .select2-results li.select2-result, .select2-drop-active .select2-results li');
+            var item = results[arguments[0]];
+            if (item) {
+              item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+              item.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+              item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            }
+          `, resultIndex);
+          await this.sleep(500);
+        }
+
+        // Final fallback: programmatic jQuery val + trigger
+        const stillOpen2 = await this.driver.executeScript<boolean>(
+          `return !!document.querySelector('.select2-drop-active');`
+        );
+        if (stillOpen2) {
+          console.log(`[Select2] "${labelText}" — forcing via jQuery...`);
+          await this.driver.executeScript(`
+            var s2s = document.querySelectorAll('.select2-container');
+            var s2 = s2s[arguments[0]];
+            if (!s2) return;
+            var sel = s2.nextElementSibling;
+            if (!sel || sel.tagName !== 'SELECT') return;
+            var text = arguments[1];
+            var opt = Array.from(sel.options).find(function(o) {
+              return o.text.toUpperCase().indexOf(text.toUpperCase()) >= 0;
+            });
+            if (opt) {
+              sel.value = opt.value;
+              var jq = window.jQuery || window.$;
+              if (jq) jq(sel).val(opt.value).trigger('change');
+              else sel.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          `, s2Index, optionText);
+        }
+
+        await this.closeOpenSelect2Dropdowns();
         await this.waitForPageLoad();
-        await this.sleep(1500);
+        await this.sleep(500);
         return true;
       }
     }
 
-    // Log options if not found
-    for (let i = 0; i < Math.min(results.length, 10); i++) {
-      const t = await results[i].getText().catch(() => '');
-      console.log(`  option[${i}]: "${t.trim()}"`);
-    }
-
-    // Close dropdown
-    await this.driver.executeScript(`
-      var drop = document.querySelector('.select2-drop-active');
-      if (drop) { drop.style.display = 'none'; drop.classList.remove('select2-drop-active'); }
+    // ── Failed — log options for debugging ──
+    const firstOptions = await this.driver.executeScript<string[]>(`
+      var results = document.querySelectorAll('.select2-drop-active .select2-results li');
+      var arr = [];
+      for (var i = 0; i < Math.min(results.length, 10); i++) arr.push(results[i].textContent.trim());
+      return arr;
     `);
+    console.log(`[Select2] "${labelText}" — ${firstOptions.length} option(s) visible:`);
+    for (const opt of firstOptions) console.log(`  "${opt}"`);
 
+    await this.closeOpenSelect2Dropdowns();
     console.warn(`[Select2] "${optionText}" not found in "${labelText}" dropdown.`);
     return false;
   }
@@ -950,13 +1423,33 @@ export class GdrfaPortalPage {
   private async setVisitReason(): Promise<void> {
     console.log('[Form] Selecting Visit Reason → Tourism...');
     const ok = await this.clickSelect2ByLabel('Visit Reason', 'Tourism');
-    if (!ok) console.warn('[Form] Visit Reason: FAILED.');
+    if (!ok) {
+      // Fallback: try selectByLabel
+      const result = await this.selectByLabel('Visit Reason', 'Tourism');
+      if (result.found) {
+        console.log(`[Form] Visit Reason set via fallback: "${result.matched}".`);
+      } else {
+        console.warn('[Form] Visit Reason: FAILED — will retry in validation pass.');
+      }
+    }
   }
 
   private async setPassportType(passportType: string): Promise<void> {
     console.log(`[Form] Setting Passport Type → "${passportType}"...`);
+    // Try 1: Physical Select2 click
     const ok = await this.clickSelect2ByLabel('Passport Type', passportType);
-    if (!ok) console.warn(`[Form] Passport Type: FAILED.`);
+    if (ok) return;
+    // Try 2: selectByLabel (programmatic + jQuery trigger)
+    console.log('[Form] Passport Type — clickSelect2 failed, trying selectByLabel...');
+    const result = await this.selectByLabel('Passport Type', passportType);
+    if (result.found) {
+      await this.waitForPageLoad();
+      console.log(`[Form] Passport Type set via fallback: "${result.matched}".`);
+      return;
+    }
+    // Try 3: Force via jQuery on any select near the label
+    console.log('[Form] Passport Type — selectByLabel failed, trying direct jQuery...');
+    await this.forceSelect2ByLabelJS('Passport Type', passportType);
   }
 
   private async enterPassportNumber(passportNumber: string): Promise<void> {
@@ -973,57 +1466,171 @@ export class GdrfaPortalPage {
 
   private async setNationality(nationalityCode: string): Promise<void> {
     const name = GdrfaPortalPage.mrzCodeToCountryName(nationalityCode);
-    console.log(`[Form] Setting Nationality: "${name}"...`);
-    const result = await this.driver.executeScript<{ found: boolean; matched: string }>(`
-      var search = arguments[0];
-      var sel = Array.from(document.querySelectorAll('select')).find(function(s) {
-        return Array.from(s.options).some(function(o) { return /^\\d+ - /.test(o.text.trim()); });
-      });
-      if (!sel) return { found: false, matched: '' };
-      sel.removeAttribute('disabled');
-      var match = Array.from(sel.options).find(function(o) { return o.text.toUpperCase().indexOf(search.toUpperCase()) >= 0; });
-      if (!match) return { found: false, matched: '' };
-      sel.value = match.value;
-      sel.dispatchEvent(new Event('change', { bubbles: true }));
-      return { found: true, matched: match.text };
-    `, name);
+    console.log(`[Form] Setting Current Nationality: "${name}"...`);
+    // Try 1: Physical Select2 click
+    const ok = await this.clickSelect2ByLabel('Current Nationality', name);
+    if (ok) {
+      await this.waitForPageLoad();
+      return;
+    }
+    // Try 2: selectByLabel (programmatic + jQuery trigger)
+    console.log('[Form] Current Nationality — clickSelect2 failed, trying selectByLabel...');
+    const result = await this.selectByLabel('Current Nationality', name);
     if (result.found) {
       await this.waitForPageLoad();
-      console.log(`[Form] Nationality set: "${result.matched}".`);
-    } else {
-      console.warn(`[Form] Nationality not found for: "${name}".`);
+      console.log(`[Form] Current Nationality set: "${result.matched}".`);
+      return;
     }
+    // Try 3: Force via jQuery on nationality-pattern selects
+    console.log('[Form] Current Nationality — selectByLabel failed, trying direct jQuery...');
+    await this.forceSelect2ByLabelJS('Current Nationality', name);
+    await this.waitForPageLoad();
   }
 
   private async setPreviousNationality(nationalityCode: string): Promise<void> {
     const name = GdrfaPortalPage.mrzCodeToCountryName(nationalityCode);
     console.log(`[Form] Setting Previous Nationality: "${name}"...`);
-    const result = await this.driver.executeScript<{ found: boolean; matched: string }>(`
-      var search = arguments[0];
-      var sel = document.querySelector('select[id*="wtcmbApplicantPreviousNationality"]');
-      if (!sel) return { found: false, matched: '' };
-      sel.removeAttribute('disabled');
-      var match = Array.from(sel.options).find(function(o) { return o.text.toUpperCase().indexOf(search.toUpperCase()) >= 0; });
-      if (!match) return { found: false, matched: '' };
-      sel.value = match.value;
-      sel.dispatchEvent(new Event('change', { bubbles: true }));
-      return { found: true, matched: match.text };
-    `, name);
+    // Try 1: Physical Select2 click
+    const ok = await this.clickSelect2ByLabel('Previous Nationality', name);
+    if (ok) {
+      await this.waitForPageLoad();
+      return;
+    }
+    // Try 2: selectByLabel (programmatic + jQuery trigger)
+    console.log('[Form] Previous Nationality — clickSelect2 failed, trying selectByLabel...');
+    const result = await this.selectByLabel('Previous Nationality', name);
     if (result.found) {
       await this.waitForPageLoad();
       console.log(`[Form] Previous Nationality set: "${result.matched}".`);
+      return;
+    }
+    // Try 3: Force via jQuery on the specific select
+    console.log('[Form] Previous Nationality — selectByLabel failed, trying direct jQuery...');
+    await this.forceSelect2ByLabelJS('Previous Nationality', name);
+    await this.waitForPageLoad();
+  }
+
+  /**
+   * Last-resort dropdown setter: finds a <select> near the given label text,
+   * removes ReadOnly, sets the value via jQuery .val().trigger('change'),
+   * and manually updates the Select2 display.
+   */
+  private async forceSelect2ByLabelJS(labelText: string, searchValue: string): Promise<void> {
+    const result = await this.driver.executeScript<{ found: boolean; matched: string }>(`
+      var labelTarget = arguments[0];
+      var search = arguments[1];
+
+      // Strategy 1: Find by <label> element
+      var labels = Array.from(document.querySelectorAll('label'));
+      var lbl = labels.find(function(l) {
+        var t = (l.textContent || '').replace(/[\\s*]/g, '').toLowerCase();
+        return t === labelTarget.replace(/[\\s*]/g, '').toLowerCase();
+      });
+
+      var sel = null;
+      if (lbl) {
+        // Try label.htmlFor
+        if (lbl.htmlFor) {
+          var el = document.getElementById(lbl.htmlFor);
+          if (el instanceof HTMLSelectElement) sel = el;
+          else if (el) sel = el.closest('.ThemeGrid_Width6,.ThemeGrid_Width12')
+            ? el.closest('.ThemeGrid_Width6,.ThemeGrid_Width12').querySelector('select')
+            : (el.parentElement ? el.parentElement.querySelector('select') : null);
+        }
+        // Walk up to find a nearby select
+        if (!sel) {
+          var row = lbl.closest('.ThemeGrid_Width6,.FormTitle,.ThemeGrid_Width12');
+          if (row && row.parentElement) sel = row.parentElement.querySelector('select');
+          if (!sel && row && row.nextElementSibling) sel = row.nextElementSibling.querySelector('select');
+        }
+      }
+
+      // Strategy 2: Find by nearby text in parent containers (like clickSelect2ByLabel does)
+      if (!sel) {
+        var selects = document.querySelectorAll('select');
+        for (var i = 0; i < selects.length; i++) {
+          var s = selects[i];
+          var parent = s.parentElement;
+          for (var d = 0; d < 6 && parent; d++) {
+            var text = (parent.textContent || '').replace(/[\\s*]/g, '').toLowerCase();
+            if (text.indexOf(labelTarget.replace(/[\\s*]/g, '').toLowerCase()) >= 0) {
+              sel = s;
+              break;
+            }
+            parent = parent.parentElement;
+          }
+          if (sel) break;
+        }
+      }
+
+      if (!sel) return { found: false, matched: 'No select found near: ' + labelTarget };
+
+      // Remove ReadOnly from Select2 container
+      var s2 = sel.previousElementSibling;
+      if (s2 && s2.classList.contains('select2-container')) {
+        s2.classList.remove('ReadOnly');
+        s2.querySelectorAll('.ReadOnly').forEach(function(el) { el.classList.remove('ReadOnly'); });
+      }
+      // Also walk up parents
+      var p = sel.parentElement;
+      for (var k = 0; k < 5 && p; k++) { p.classList.remove('ReadOnly'); p = p.parentElement; }
+      sel.removeAttribute('disabled');
+
+      // Find matching option
+      var opts = Array.from(sel.options);
+      var match = opts.find(function(o) { return o.text.trim().toUpperCase() === search.toUpperCase(); })
+        || opts.find(function(o) {
+          // Strip leading number prefix (e.g. "349 - SOUTH AFRICA" → "SOUTH AFRICA")
+          var clean = o.text.replace(/^\\d+\\s*-\\s*/, '').trim();
+          return clean.toUpperCase() === search.toUpperCase();
+        })
+        || opts.find(function(o) { return o.text.toUpperCase().indexOf(search.toUpperCase()) >= 0; });
+      if (!match) return { found: false, matched: 'Option not found: ' + search };
+
+      // Set value with jQuery to trigger Select2 update
+      sel.value = match.value;
+      var jq = window.jQuery || window.$;
+      if (jq) {
+        jq(sel).val(match.value).trigger('change');
+      } else {
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+
+      // Manually update Select2 display text
+      if (s2) {
+        var chosen = s2.querySelector('.select2-chosen');
+        if (chosen) chosen.textContent = match.text.trim();
+      }
+
+      return { found: true, matched: match.text.trim() };
+    `, labelText, searchValue);
+
+    if (result.found) {
+      console.log(`[Form] ${labelText} force-set: "${result.matched}".`);
     } else {
-      console.warn(`[Form] Previous Nationality not found for: "${name}".`);
+      console.warn(`[Form] ${labelText} force-set FAILED: ${result.matched}`);
     }
   }
 
   private async clickSearchDataAndWait(): Promise<void> {
+    // Close any lingering Select2 dropdowns that might intercept the click
+    await this.closeOpenSelect2Dropdowns();
+    await this.sleep(300);
+
     console.log('[Form] Clicking Search Data...');
     const btn = await this.waitForElement(
       By.xpath('//a[contains(text(),"Search Data")] | //button[contains(text(),"Search Data")] | //input[@value="Search Data"]'),
       10000
     );
-    await btn.click();
+    await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', btn);
+    await this.sleep(300);
+    // Use JS click as fallback in case something still overlaps
+    try {
+      await btn.click();
+    } catch {
+      console.log('[Form] Search Data native click blocked — using JS click...');
+      await this.driver.executeScript('arguments[0].click();', btn);
+    }
     // Wait for the portal AJAX call to populate SmartInput fields
     await this.waitForPageLoad();
 
@@ -1078,6 +1685,52 @@ export class GdrfaPortalPage {
   // ── Passport detail fields (below name fields) ─────────────────────────────
 
   private async fillPassportDetails(passport: PassportDetails): Promise<void> {
+    // ── DROPDOWNS FIRST (they trigger AJAX postbacks that can wipe text/date fields) ──
+
+    const birthCountry = GdrfaPortalPage.mrzCodeToCountryName(passport.birthCountry);
+    console.log(`[Form] Setting Birth Country: "${birthCountry}"...`);
+    const bcResult = await this.selectByLabel('Birth Country', birthCountry);
+    if (bcResult.skipped) {
+      console.log(`[Skip] Birth Country already set: "${bcResult.matched}".`);
+    } else if (bcResult.found) {
+      await this.waitForPageLoad();
+      await this.sleep(500);
+      console.log(`[Form] Birth Country set: "${bcResult.matched}".`);
+    } else {
+      console.warn(`[Form] Birth Country not found for: "${birthCountry}".`);
+    }
+
+    console.log(`[Form] Setting Gender: "${passport.gender}"...`);
+    const gResult = await this.selectByLabel('Gender', passport.gender);
+    if (gResult.skipped) {
+      console.log(`[Skip] Gender already set: "${gResult.matched}".`);
+    } else if (gResult.found) {
+      await this.waitForPageLoad();
+      await this.sleep(500);
+      console.log(`[Form] Gender set: "${gResult.matched}".`);
+    } else {
+      console.warn(`[Form] Gender not found for: "${passport.gender}".`);
+    }
+
+    if (passport.passportIssueCountry) {
+      const issueCountry = GdrfaPortalPage.mrzCodeToCountryName(passport.passportIssueCountry);
+      console.log(`[Form] Setting Passport Issue Country: "${issueCountry}"...`);
+      const icResult = await this.selectByLabel('Passport Issue Country', issueCountry);
+      if (icResult.skipped) {
+        console.log(`[Skip] Passport Issue Country already set: "${icResult.matched}".`);
+      } else if (icResult.found) {
+        await this.waitForPageLoad();
+        await this.sleep(500);
+        console.log(`[Form] Passport Issue Country set: "${icResult.matched}".`);
+      } else {
+        console.warn(`[Form] Passport Issue Country not found for: "${issueCountry}".`);
+      }
+    } else {
+      console.log('[Form] Passport Issue Country — skipped (empty).');
+    }
+
+    // ── DATE FIELDS (after all dropdowns, so AJAX won't wipe them) ──
+
     // Date of Birth
     const dob = passport.dateOfBirth.replace(/\//g, '-');
     console.log(`[Form] Filling Date of Birth: "${dob}"...`);
@@ -1099,55 +1752,6 @@ export class GdrfaPortalPage {
       `);
       await this.waitForPageLoad();
       console.log('[Form] Date of Birth filled.');
-    }
-
-    const birthCountry = GdrfaPortalPage.mrzCodeToCountryName(passport.birthCountry);
-    console.log(`[Form] Setting Birth Country: "${birthCountry}"...`);
-    const bcResult = await this.selectByLabel('Birth Country', birthCountry);
-    if (bcResult.skipped) {
-      console.log(`[Skip] Birth Country already set: "${bcResult.matched}".`);
-    } else if (bcResult.found) {
-      await this.waitForPageLoad();
-      console.log(`[Form] Birth Country set: "${bcResult.matched}".`);
-    } else {
-      console.warn(`[Form] Birth Country not found for: "${birthCountry}".`);
-    }
-
-    // Birth Place EN
-    const birthPlace = /^[A-Z]{3}$/.test(passport.birthPlaceEN.trim())
-      ? GdrfaPortalPage.mrzCodeToCountryName(passport.birthPlaceEN.trim())
-      : passport.birthPlaceEN;
-    console.log(`[Form] Filling Birth Place EN: "${birthPlace}"...`);
-    const bpFilled = await this.editAndFill('inpApplicantBirthPlaceEn', birthPlace);
-    if (bpFilled) {
-      await this.driver.executeScript(`if (window.translateInputText) translateInputText('inpApplicantBirthPlaceEn');`);
-      await this.sleep(200);
-      console.log('[Form] Birth Place EN filled + translated.');
-    }
-
-    console.log(`[Form] Setting Gender: "${passport.gender}"...`);
-    const gResult = await this.selectByLabel('Gender', passport.gender);
-    if (gResult.skipped) {
-      console.log(`[Skip] Gender already set: "${gResult.matched}".`);
-    } else if (gResult.found) {
-      console.log(`[Form] Gender set: "${gResult.matched}".`);
-    } else {
-      console.warn(`[Form] Gender not found for: "${passport.gender}".`);
-    }
-
-    if (passport.passportIssueCountry) {
-      const issueCountry = GdrfaPortalPage.mrzCodeToCountryName(passport.passportIssueCountry);
-      console.log(`[Form] Setting Passport Issue Country: "${issueCountry}"...`);
-      const icResult = await this.selectByLabel('Passport Issue Country', issueCountry);
-      if (icResult.skipped) {
-        console.log(`[Skip] Passport Issue Country already set: "${icResult.matched}".`);
-      } else if (icResult.found) {
-        console.log(`[Form] Passport Issue Country set: "${icResult.matched}".`);
-      } else {
-        console.warn(`[Form] Passport Issue Country not found for: "${issueCountry}".`);
-      }
-    } else {
-      console.log('[Form] Passport Issue Country — skipped (empty).');
     }
 
     if (passport.passportIssueDate) {
@@ -1198,6 +1802,20 @@ export class GdrfaPortalPage {
       console.log('[Form] Passport Expiry Date filled.');
     }
 
+    // ── TEXT FIELDS (last — least likely to trigger AJAX) ──
+
+    // Birth Place EN
+    const birthPlace = /^[A-Z]{3}$/.test(passport.birthPlaceEN.trim())
+      ? GdrfaPortalPage.mrzCodeToCountryName(passport.birthPlaceEN.trim())
+      : passport.birthPlaceEN;
+    console.log(`[Form] Filling Birth Place EN: "${birthPlace}"...`);
+    const bpFilled = await this.editAndFill('inpApplicantBirthPlaceEn', birthPlace);
+    if (bpFilled) {
+      await this.driver.executeScript(`if (window.translateInputText) translateInputText('inpApplicantBirthPlaceEn');`);
+      await this.sleep(300);
+      console.log('[Form] Birth Place EN filled + translated.');
+    }
+
     if (passport.passportPlaceOfIssueEN) {
       const placeOfIssue = /^[A-Z]{3}$/.test(passport.passportPlaceOfIssueEN.trim())
         ? GdrfaPortalPage.mrzCodeToCountryName(passport.passportPlaceOfIssueEN.trim())
@@ -1206,7 +1824,7 @@ export class GdrfaPortalPage {
       const poiFilled = await this.editAndFill('inpPassportPlaceIssueEn', placeOfIssue);
       if (poiFilled) {
         await this.driver.executeScript(`if (window.translateInputText) translateInputText('inpPassportPlaceIssueEn');`);
-        await this.sleep(200);
+        await this.sleep(300);
         console.log('[Form] Place of Issue EN filled + translated.');
       }
     } else {
@@ -1232,18 +1850,7 @@ export class GdrfaPortalPage {
       console.log('[Form] Is Inside UAE checked.');
     }
 
-    // Mother Name EN
-    if (applicant.motherNameEN) {
-      console.log(`[Form] Filling Mother Name EN: "${applicant.motherNameEN}"...`);
-      const motherFilled = await this.editAndFill('inpMotherNameEn', applicant.motherNameEN);
-      if (motherFilled) {
-        await this.driver.executeScript(`if (window.translateInputText) translateInputText('inpMotherNameEn');`);
-        await this.sleep(200);
-        console.log('[Form] Mother Name EN filled + translated.');
-      }
-    } else {
-      console.log('[Form] Mother Name EN — skipped (empty).');
-    }
+    // ── DROPDOWNS FIRST (they trigger AJAX that can wipe text fields) ──
 
     // Marital Status
     if (applicant.maritalStatus) {
@@ -1318,6 +1925,20 @@ export class GdrfaPortalPage {
       }
     }
 
+    // First Language — always English
+    {
+      console.log('[Form] Setting First Language → English...');
+      const flResult = await this.clickSelect2ByLabel('First Language', 'English');
+      if (!flResult) {
+        const fallback = await this.selectByLabel('First Language', 'English');
+        if (fallback.found) {
+          console.log(`[Form] First Language set (fallback): "${fallback.matched}".`);
+        } else {
+          console.warn('[Form] First Language: could not set — will retry in validation pass.');
+        }
+      }
+    }
+
     // Profession — hardcoded to SALES EXECUTIVE
     {
       console.log('[Form] Setting Profession → SALES EXECUTIVE...');
@@ -1366,7 +1987,7 @@ export class GdrfaPortalPage {
       `);
 
       if (profSet) {
-        await this.sleep(800);
+        await this.sleep(300);
         console.log('[Form] Profession → SALES EXECUTIVE.');
       } else {
         console.warn('[Form] Profession: no input found on page.');
@@ -1394,25 +2015,24 @@ export class GdrfaPortalPage {
     } else {
       console.log('[Form] Coming From Country — skipped (empty).');
     }
+
+    // ── TEXT FIELDS (after all dropdowns, so AJAX won't wipe them) ──
+
+    // Mother Name EN
+    if (applicant.motherNameEN) {
+      console.log(`[Form] Filling Mother Name EN: "${applicant.motherNameEN}"...`);
+      const motherFilled = await this.editAndFill('inpMotherNameEn', applicant.motherNameEN);
+      if (motherFilled) {
+        await this.driver.executeScript(`if (window.translateInputText) translateInputText('inpMotherNameEn');`);
+        console.log('[Form] Mother Name EN filled + translated.');
+      }
+    }
   }
 
   // ── Contact detail fields ─────────────────────────────────────────────────
 
   private async fillContactDetails(contact: ContactDetails): Promise<void> {
-    if (contact.email) {
-      console.log(`[Form] Filling Email: "${contact.email}"...`);
-      await this.editAndFill('inpEmail', contact.email);
-    }
-
-    if (contact.mobileNumber) {
-      console.log(`[Form] Filling Mobile Number: "${contact.mobileNumber}"...`);
-      await this.editAndFill('inpMobileNumber', contact.mobileNumber);
-    }
-
-    if (contact.approvalEmailCopy) {
-      console.log(`[Form] Filling Approval Email Copy: "${contact.approvalEmailCopy}"...`);
-      await this.editAndFill('inpApprovalEmailCopy', contact.approvalEmailCopy);
-    }
+    // ── DROPDOWNS FIRST (they trigger AJAX postbacks that can wipe text fields) ──
 
     if (contact.preferredSMSLanguage) {
       console.log(`[Form] Setting Preferred SMS Language: "${contact.preferredSMSLanguage}"...`);
@@ -1426,7 +2046,7 @@ export class GdrfaPortalPage {
       }
     }
 
-    // ── Address Inside UAE ──────────────────────────────────────────────────
+    // ── Address Inside UAE (dropdowns) ──────────────────────────────────────
 
     if (contact.uaeEmirate) {
       console.log(`[Form] Setting Emirate: "${contact.uaeEmirate}"...`);
@@ -1460,6 +2080,7 @@ export class GdrfaPortalPage {
       }
     }
 
+    // Area dropdown (depends on City AJAX, so placed after City but before text fields)
     if (contact.uaeArea) {
       console.log(`[Form] Setting Area: "${contact.uaeArea}"...`);
       await this.waitForCondition(async () => {
@@ -1472,10 +2093,43 @@ export class GdrfaPortalPage {
       if (areaResult.skipped) {
         console.log(`[Skip] Area already set: "${areaResult.matched}".`);
       } else if (areaResult.found) {
+        await this.waitForPageLoad();
         console.log(`[Form] Area set: "${areaResult.matched}".`);
       } else {
         console.warn(`[Form] Area not found for: "${contact.uaeArea}".`);
       }
+    }
+
+    // Outside Country dropdown (before outside text fields)
+    if (contact.outsideCountry) {
+      const countryName = GdrfaPortalPage.mrzCodeToCountryName(contact.outsideCountry);
+      console.log(`[Form] Setting Outside Country: "${countryName}"...`);
+      const ocResult = await this.selectByStaticId('cmbApplicantOutsideCountry', countryName);
+      if (ocResult.skipped) {
+        console.log(`[Skip] Outside Country already set: "${ocResult.matched}".`);
+      } else if (ocResult.found) {
+        await this.waitForPageLoad();
+        console.log(`[Form] Outside Country set: "${ocResult.matched}".`);
+      } else {
+        console.warn(`[Form] Outside Country not found for: "${countryName}".`);
+      }
+    }
+
+    // ── TEXT FIELDS (after ALL dropdowns, so AJAX won't wipe them) ──────────
+
+    if (contact.email) {
+      console.log(`[Form] Filling Email: "${contact.email}"...`);
+      await this.editAndFill('inpEmail', contact.email);
+    }
+
+    if (contact.mobileNumber) {
+      console.log(`[Form] Filling Mobile Number: "${contact.mobileNumber}"...`);
+      await this.editAndFill('inpMobileNumber', contact.mobileNumber);
+    }
+
+    if (contact.approvalEmailCopy) {
+      console.log(`[Form] Filling Approval Email Copy: "${contact.approvalEmailCopy}"...`);
+      await this.editAndFill('inpApprovalEmailCopy', contact.approvalEmailCopy);
     }
 
     if (contact.uaeStreet) {
@@ -1498,21 +2152,7 @@ export class GdrfaPortalPage {
       await this.editAndFill('inpFlatNo', contact.uaeFlat);
     }
 
-    // ── Address Outside UAE ─────────────────────────────────────────────────
-
-    if (contact.outsideCountry) {
-      const countryName = GdrfaPortalPage.mrzCodeToCountryName(contact.outsideCountry);
-      console.log(`[Form] Setting Outside Country: "${countryName}"...`);
-      const ocResult = await this.selectByStaticId('cmbApplicantOutsideCountry', countryName);
-      if (ocResult.skipped) {
-        console.log(`[Skip] Outside Country already set: "${ocResult.matched}".`);
-      } else if (ocResult.found) {
-        await this.waitForPageLoad();
-        console.log(`[Form] Outside Country set: "${ocResult.matched}".`);
-      } else {
-        console.warn(`[Form] Outside Country not found for: "${countryName}".`);
-      }
-    }
+    // ── Address Outside UAE (text fields — dropdown already set above) ──────
 
     if (contact.outsideMobile) {
       console.log(`[Form] Filling Outside Mobile: "${contact.outsideMobile}"...`);
@@ -1572,7 +2212,7 @@ export class GdrfaPortalPage {
         if (choice) choice.click();
       }
     `);
-    await this.sleep(100);
+    await this.sleep(500);
 
     // Remove ReadOnly from the drop panel
     await this.driver.executeScript(`
@@ -1582,7 +2222,7 @@ export class GdrfaPortalPage {
         drop.querySelectorAll('.ReadOnly').forEach(function(el) { el.classList.remove('ReadOnly'); });
       }
     `);
-    await this.sleep(100);
+    await this.sleep(500);
 
     // Click the matching option
     const matchedText = await this.driver.executeScript<string>(`
@@ -1632,6 +2272,9 @@ export class GdrfaPortalPage {
         console.log(`[Validate] Retrying "${field.name}"...`);
         try {
           await field.retry();
+          // Wait for AJAX to settle between retries (dropdown selections can trigger postbacks)
+          await this.waitForPageLoad();
+          await this.sleep(500);
           console.log(`[Validate] "${field.name}" — retried.`);
         } catch (e) {
           console.warn(`[Validate] "${field.name}" — retry failed: ${e}`);
@@ -1685,6 +2328,11 @@ export class GdrfaPortalPage {
       return val.length > 0 && !val.includes('Select');
     };
 
+    // Visit Reason — always Tourism
+    if (!await selectByLabelHasValue('Visit Reason')) {
+      empty.push({ name: 'Visit Reason', retry: () => this.setVisitReason() });
+    }
+
     // Passport Names
     if (app.passport.firstName && !await inputHasValue('inpFirsttNameEn')) {
       empty.push({ name: 'First Name', retry: () => this.editAndFill('inpFirsttNameEn', app.passport.firstName) });
@@ -1693,18 +2341,24 @@ export class GdrfaPortalPage {
       empty.push({ name: 'Last Name', retry: () => this.editAndFill('inpLastNameEn', app.passport.lastName) });
     }
 
-    // Passport Details
+    // Passport Details — dates need / → - transformation to match portal format
     if (app.passport.dateOfBirth && !await inputHasValue('inpDateOfBirth')) {
-      empty.push({ name: 'Date of Birth', retry: () => this.editAndFill('inpDateOfBirth', app.passport.dateOfBirth) });
+      const dob = app.passport.dateOfBirth.replace(/\//g, '-');
+      empty.push({ name: 'Date of Birth', retry: () => this.editAndFill('inpDateOfBirth', dob) });
     }
     if (app.passport.birthPlaceEN && !await inputHasValue('inpApplicantBirthPlaceEn')) {
-      empty.push({ name: 'Birth Place', retry: () => this.editAndFill('inpApplicantBirthPlaceEn', app.passport.birthPlaceEN) });
+      const bp = /^[A-Z]{3}$/.test(app.passport.birthPlaceEN.trim())
+        ? GdrfaPortalPage.mrzCodeToCountryName(app.passport.birthPlaceEN.trim())
+        : app.passport.birthPlaceEN;
+      empty.push({ name: 'Birth Place', retry: () => this.editAndFill('inpApplicantBirthPlaceEn', bp) });
     }
     if (app.passport.passportIssueDate && !await inputHasValue('inpPassportIssueDate')) {
-      empty.push({ name: 'Passport Issue Date', retry: () => this.editAndFill('inpPassportIssueDate', app.passport.passportIssueDate) });
+      const issueDate = app.passport.passportIssueDate.replace(/\//g, '-');
+      empty.push({ name: 'Passport Issue Date', retry: () => this.editAndFill('inpPassportIssueDate', issueDate) });
     }
     if (app.passport.passportExpiryDate && !await inputHasValue('inpPassportExpiryDate')) {
-      empty.push({ name: 'Passport Expiry Date', retry: () => this.editAndFill('inpPassportExpiryDate', app.passport.passportExpiryDate) });
+      const expiryDate = app.passport.passportExpiryDate.replace(/\//g, '-');
+      empty.push({ name: 'Passport Expiry Date', retry: () => this.editAndFill('inpPassportExpiryDate', expiryDate) });
     }
     if (app.passport.passportPlaceOfIssueEN && !await inputHasValue('inpPassportPlaceIssueEn')) {
       const poi = /^[A-Z]{3}$/.test(app.passport.passportPlaceOfIssueEN.trim())
@@ -1713,15 +2367,17 @@ export class GdrfaPortalPage {
       empty.push({ name: 'Passport Place of Issue', retry: () => this.editAndFill('inpPassportPlaceIssueEn', poi) });
     }
 
-    // Passport Selects
+    // Passport Selects — use mrzCodeToCountryName for country fields
     if (app.passport.gender && !await selectByLabelHasValue('Gender')) {
       empty.push({ name: 'Gender', retry: async () => { await this.selectByLabel('Gender', app.passport.gender); } });
     }
     if (app.passport.birthCountry && !await selectByLabelHasValue('Birth Country')) {
-      empty.push({ name: 'Birth Country', retry: async () => { await this.selectByLabel('Birth Country', app.passport.birthCountry); } });
+      const bcName = GdrfaPortalPage.mrzCodeToCountryName(app.passport.birthCountry);
+      empty.push({ name: 'Birth Country', retry: async () => { await this.selectByLabel('Birth Country', bcName); } });
     }
     if (app.passport.passportIssueCountry && !await selectByLabelHasValue('Passport Issue Country')) {
-      empty.push({ name: 'Passport Issue Country', retry: async () => { await this.selectByLabel('Passport Issue Country', app.passport.passportIssueCountry); } });
+      const icName = GdrfaPortalPage.mrzCodeToCountryName(app.passport.passportIssueCountry);
+      empty.push({ name: 'Passport Issue Country', retry: async () => { await this.selectByLabel('Passport Issue Country', icName); } });
     }
 
     // Applicant Details
@@ -1739,6 +2395,12 @@ export class GdrfaPortalPage {
     }
     if (app.applicant.faith && !await selectHasValue('cmbApplicantFaith')) {
       empty.push({ name: 'Faith', retry: () => this.retryFaithSelection(app.applicant.faith!) });
+    }
+    if (!await selectByLabelHasValue('First Language')) {
+      empty.push({ name: 'First Language', retry: async () => {
+        const ok = await this.clickSelect2ByLabel('First Language', 'English');
+        if (!ok) await this.selectByLabel('First Language', 'English');
+      }});
     }
 
     // Contact Details
@@ -1785,35 +2447,142 @@ export class GdrfaPortalPage {
 
   // ── Continue button ────────────────────────────────────────────────────────
 
-  private async waitForLoaderToDisappear(): Promise<void> {
-    try {
-      const loaders = await this.driver.findElements(By.css('div.Feedback_AjaxWait'));
-      for (const loader of loaders) {
-        if (await loader.isDisplayed().catch(() => false)) {
-          console.log('[Loader] Waiting for loader to disappear...');
-          await this.driver.wait(until.stalenessOf(loader), 30000).catch(() => {});
-          console.log('[Loader] Loader gone.');
+  private async waitForLoaderToDisappear(timeout = 60000): Promise<void> {
+    const start = Date.now();
+    const deadline = start + timeout;
+    let forceHideAttempted = false;
+    console.log('[Loader] Checking for loading overlays...');
+
+    while (Date.now() < deadline) {
+      const elapsed = Date.now() - start;
+
+      const status = await this.driver.executeScript<string>(`
+        var overlayVisible = false;
+        var ajaxActive = false;
+
+        // Check OutSystems AJAX loader
+        var loaders = document.querySelectorAll('div.Feedback_AjaxWait, .os-internal-Feedback_AjaxWait');
+        for (var i = 0; i < loaders.length; i++) {
+          var s = window.getComputedStyle(loaders[i]);
+          if (s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0') overlayVisible = true;
         }
+
+        // Check jQuery/osjs AJAX
+        if (typeof jQuery !== 'undefined' && jQuery.active > 0) ajaxActive = true;
+        if (typeof osjs !== 'undefined' && osjs.active > 0) ajaxActive = true;
+
+        if (!overlayVisible) return 'CLEAR';
+        if (ajaxActive) return 'AJAX_ACTIVE';
+        return 'OVERLAY_STUCK';
+      `);
+
+      if (status === 'CLEAR') {
+        console.log(`[Loader] Overlay gone after ${(elapsed / 1000).toFixed(1)}s.`);
+        return;
       }
-    } catch {
-      // Loader may have already disappeared
+
+      // After 30s: if AJAX is done but overlay stuck, force-hide it
+      if (elapsed > 30000 && status === 'OVERLAY_STUCK' && !forceHideAttempted) {
+        forceHideAttempted = true;
+        console.log('[Loader] AJAX done but overlay still visible after 30s — force-hiding...');
+        await this.driver.executeScript(`
+          // Force-hide all OutSystems loading overlays
+          var loaders = document.querySelectorAll('div.Feedback_AjaxWait, .os-internal-Feedback_AjaxWait');
+          for (var i = 0; i < loaders.length; i++) {
+            loaders[i].style.display = 'none';
+            loaders[i].style.visibility = 'hidden';
+          }
+          // Also hide any full-page overlay with the loading message
+          document.querySelectorAll('div').forEach(function(el) {
+            if ((el.textContent || '').indexOf('Please wait while content is loading') >= 0 && el.children.length < 5) {
+              el.style.display = 'none';
+              // Also try the parent (sometimes it's wrapped)
+              if (el.parentElement) el.parentElement.style.display = 'none';
+            }
+          });
+        `);
+        await this.sleep(1000);
+        continue;
+      }
+
+      // After 45s: regardless of AJAX state, force-hide everything
+      if (elapsed > 45000 && !forceHideAttempted) {
+        forceHideAttempted = true;
+        console.warn('[Loader] Loader stuck for 45s — force-hiding all overlays...');
+        await this.driver.executeScript(`
+          document.querySelectorAll('div.Feedback_AjaxWait, .os-internal-Feedback_AjaxWait').forEach(function(el) {
+            el.style.display = 'none';
+          });
+          // Kill any pending AJAX
+          if (typeof jQuery !== 'undefined') {
+            try { jQuery.active = 0; } catch(e) {}
+          }
+          if (typeof osjs !== 'undefined') {
+            try { osjs.active = 0; } catch(e) {}
+          }
+        `);
+        await this.sleep(1000);
+        continue;
+      }
+
+      await this.sleep(1000);
     }
+    console.warn(`[Loader] Timeout after ${timeout / 1000}s — proceeding anyway.`);
   }
 
   private async clickContinue(): Promise<void> {
     console.log('[Form] Clicking Continue...');
-    const btn = await this.driver.findElement(By.css('input[staticid="SmartChannels_EntryPermitNewTourism_btnContinue"]'));
+    const btn = await this.driver.wait(
+      until.elementLocated(By.css('input[staticid="SmartChannels_EntryPermitNewTourism_btnContinue"]')),
+      10000,
+      'Continue button not found within 10s',
+    );
     await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', btn);
     await btn.click();
     console.log('[Form] Continue clicked — waiting for popup or next page...');
 
-    const popupFrame = await this.findPopupFrame(30000);
+    // Brief pause so the portal has time to show the popup or the loader
+    await this.sleep(2000);
+
+    const popupFrame = await this.findPopupFrame(15000);
 
     if (popupFrame) {
       console.log('[Form] Existing application popup detected (in iframe).');
       await this.handleExistingApplicationPopup();
     } else {
-      console.log('[Form] No popup — proceeding...');
+      console.log('[Form] No popup — waiting for loader to clear...');
+    }
+
+    // Wait for the "Please wait while content is loading..." overlay to disappear
+    await this.waitForLoaderToDisappear(90000);
+    await this.waitForPageLoad();
+    await this.sleep(2000);
+
+    // Verify the attachments section actually loaded (document upload cards present)
+    const ready = await this.driver.executeScript<boolean>(`
+      // Check for file upload inputs (sign of attachments tab)
+      var inputs = document.querySelectorAll('input[type="file"]');
+      if (inputs.length > 0) return true;
+      // Check for document card containers
+      var cards = document.querySelectorAll('[id*="cntDocList"], [id*="CardGray"]');
+      return cards.length > 0;
+    `);
+
+    if (ready) {
+      console.log('[Form] Attachments section loaded — document upload cards found.');
+    } else {
+      console.log('[Form] Attachments section not yet visible — waiting longer...');
+      // Wait up to 30 more seconds for file inputs to appear
+      for (let i = 0; i < 30; i++) {
+        const found = await this.driver.executeScript<boolean>(`
+          return document.querySelectorAll('input[type="file"]').length > 0;
+        `);
+        if (found) {
+          console.log('[Form] Document upload cards appeared.');
+          break;
+        }
+        await this.sleep(1000);
+      }
     }
   }
 
@@ -2214,18 +2983,36 @@ export class GdrfaPortalPage {
     }, 15000).catch(() => {});
     await this.sleep(500);
 
-    // Click the first matching result using mousedown (Select2 uses mousedown, not click)
+    // Click the best matching result — prefer exact match over partial
     const matchedText = await this.driver.executeScript<string>(`
+      var search = arguments[0];
       var results = document.querySelectorAll('.select2-drop-active .select2-results li.select2-result');
       if (results.length === 0) return '';
-      var item = results[0];
+
+      // Find best match: exact > starts-with > first
+      var item = null;
+      for (var i = 0; i < results.length; i++) {
+        var t = results[i].textContent.trim();
+        // Extract text after "NNN - " prefix (e.g. "116 - CHINA" → "CHINA")
+        var label = t.replace(/^\\d+\\s*-\\s*/, '').trim();
+        if (label.toUpperCase() === search.toUpperCase()) { item = results[i]; break; }
+      }
+      if (!item) {
+        for (var i = 0; i < results.length; i++) {
+          var t = results[i].textContent.trim();
+          var label = t.replace(/^\\d+\\s*-\\s*/, '').trim();
+          if (label.toUpperCase().indexOf(search.toUpperCase()) === 0) { item = results[i]; break; }
+        }
+      }
+      if (!item) item = results[0];
+
       var text = item.textContent.trim();
       // Select2 listens on mouseup after mousedown — simulate the full sequence
       item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
       item.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
       item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
       return text;
-    `);
+    `, searchValue);
 
     if (matchedText) {
       await this.sleep(1500);
@@ -2300,11 +3087,19 @@ export class GdrfaPortalPage {
   private async waitForPageLoad(timeout = 15000): Promise<void> {
     try {
       await this.driver.wait(async () => {
-        const state = await this.driver.executeScript<string>('return document.readyState');
-        return state === 'complete';
+        const ready = await this.driver.executeScript<boolean>(`
+          // Check document.readyState
+          if (document.readyState !== 'complete') return false;
+          // Check jQuery AJAX
+          if (typeof jQuery !== 'undefined' && jQuery.active > 0) return false;
+          // Check OutSystems AJAX
+          if (typeof osjs !== 'undefined' && osjs.active > 0) return false;
+          return true;
+        `);
+        return ready;
       }, timeout);
-      // Extra wait for AJAX to settle
-      await this.sleep(500);
+      // Brief settle time after all AJAX completes
+      await this.sleep(300);
     } catch {
       // Timeout is acceptable — page may have slow-loading resources
     }
@@ -2321,6 +3116,27 @@ export class GdrfaPortalPage {
       await this.sleep(250);
     }
     throw new Error(`Condition not met within ${timeout}ms`);
+  }
+
+  /** Close any open Select2 dropdowns to prevent them from blocking clicks on other elements. */
+  private async closeOpenSelect2Dropdowns(): Promise<void> {
+    await this.driver.executeScript(`
+      // Close active Select2 drop panels
+      document.querySelectorAll('.select2-drop-active').forEach(function(drop) {
+        drop.style.display = 'none';
+        drop.classList.remove('select2-drop-active');
+      });
+      // Remove active state from containers
+      document.querySelectorAll('.select2-container-active').forEach(function(c) {
+        c.classList.remove('select2-container-active');
+      });
+      // Close any select2-drop that's still visible
+      document.querySelectorAll('.select2-drop').forEach(function(d) {
+        if (window.getComputedStyle(d).display !== 'none') {
+          d.style.display = 'none';
+        }
+      });
+    `);
   }
 
   private sleep(ms: number): Promise<void> {
@@ -2373,7 +3189,62 @@ export class GdrfaPortalPage {
       UKR: 'UKRAINE',       URY: 'URGWAY',         UZB: 'UZBAKISTAN',    YEM: 'YEMEN',
       ZMB: 'ZAMBIA',        ZWE: 'ZIMBABWE',
     };
-    return map[code.toUpperCase()] ?? code;
+    const upper = code.toUpperCase().trim();
+
+    // Direct MRZ code lookup (e.g. "IND" → "INDIA")
+    if (map[upper]) return map[upper];
+
+    // Already a country name in the map? Return as-is (e.g. "INDIA" → "INDIA")
+    const allNames = Object.values(map);
+    if (allNames.includes(upper)) return upper;
+
+    // Nationality adjective → country name (e.g. "INDIAN" → "INDIA", "CHINESE" → "CHINA")
+    const adjectiveMap: Record<string, string> = {
+      INDIAN: 'INDIA',           CHINESE: 'CHINA',          AMERICAN: 'U S A',
+      BRITISH: 'BRITAIN',        FRENCH: 'FRANCE',          GERMAN: 'GERMANY',
+      JAPANESE: 'JAPAN',         KOREAN: 'KOREA',           AUSTRALIAN: 'AUSTRALIA',
+      CANADIAN: 'CANADA',        RUSSIAN: 'RUSSIA',         BRAZILIAN: 'BRAZIL',
+      MEXICAN: 'MEXICO',         ITALIAN: 'ITALY',          SPANISH: 'SPAIN',
+      PORTUGUESE: 'PORTUGAL',    DUTCH: 'HOLLAND',          BELGIAN: 'BELGIUM',
+      SWISS: 'SWITZERLAND',      SWEDISH: 'SWEDEN',         NORWEGIAN: 'NORWAY',
+      DANISH: 'DENMARK',         FINNISH: 'FINLAND',        POLISH: 'POLAND',
+      TURKISH: 'TURKEY',         EGYPTIAN: 'EGYPT',         SOUTH_AFRICAN: 'SOUTH AFRICA',
+      NIGERIAN: 'NIGERIA',       KENYAN: 'KENYA',           GHANAIAN: 'GHANA',
+      PAKISTANI: 'PAKISTAN',      BANGLADESHI: 'BANGLADESH', SRI_LANKAN: 'SRI LANKA',
+      NEPALESE: 'NEPAL',         NEPALI: 'NEPAL',           THAI: 'THAILAND',
+      FILIPINO: 'PHILLIPINE',    INDONESIAN: 'INDONESIA',   MALAYSIAN: 'MALAYSIA',
+      SINGAPOREAN: 'SINGAPORE',  VIETNAMESE: 'VIETNAM',     IRAQI: 'IRAQ',
+      IRANIAN: 'IRAN',           SAUDI: 'SAUDIA',           EMIRATI: 'EMIRATES',
+      KUWAITI: 'KUWAIT',         QATARI: 'QATAR',           OMANI: 'OMAN',
+      BAHRAINI: 'BAHRAIN',       JORDANIAN: 'JORDAN',       LEBANESE: 'LEBANON',
+      SYRIAN: 'SYRIA',           YEMENI: 'YEMEN',           MOROCCAN: 'MOROCCO',
+      TUNISIAN: 'TUNISIA',       ALGERIAN: 'ALGERIA',       ETHIOPIAN: 'ETHIOPIA',
+      SOMALI: 'SOMALIA',         SUDANESE: 'SUDAN',         AFGHAN: 'AFGHANISTAN',
+      UZBEK: 'UZBAKISTAN',       UKRAINIAN: 'UKRAINE',      COLOMBIAN: 'COLOMBIA',
+      PERUVIAN: 'PERU',          ARGENTINIAN: 'ARGENTINA',  CHILEAN: 'CHILE',
+      ECUADORIAN: 'ECUADOR',     VENEZUELAN: 'VENEZUELA',   CUBAN: 'CUBA',
+      JAMAICAN: 'JAMAICA',       TRINIDADIAN: 'TRINIDAD',   IRISH: 'IRELAND',
+      SCOTTISH: 'BRITAIN',       WELSH: 'BRITAIN',          GREEK: 'GREECE',
+      CZECH: 'CZECH',            HUNGARIAN: 'HUNGARY',      ROMANIAN: 'ROMANIA',
+      BULGARIAN: 'BULGARIA',     CROATIAN: 'CROATIA',       SERBIAN: 'SERBIA',
+      BOSNIAN: 'BOSNIA',         ALBANIAN: 'ALBANIA',       GEORGIAN: 'GEORGIA',
+      ARMENIAN: 'ARMENIA',       AZERBAIJANI: 'AZERBAIJAN', KAZAKH: 'KAZAKHESTAN',
+      CAMBODIAN: 'CAMBODIA',     BURMESE: 'BURMA',          LAOTIAN: 'LAOS',
+      SOUTH_KOREAN: 'SOUTH KOREA', NORTH_KOREAN: 'NORTH KOREA',
+    };
+    // Also handle underscores/spaces: "SOUTH AFRICAN" → "SOUTH_AFRICAN"
+    const normalised = upper.replace(/\s+/g, '_');
+    if (adjectiveMap[upper]) return adjectiveMap[upper];
+    if (adjectiveMap[normalised]) return adjectiveMap[normalised];
+
+    // Fuzzy: strip common nationality suffixes and check if that's a country
+    const stripped = upper
+      .replace(/(IAN|AN|ESE|ISH|I|ER)$/, '')
+      .trim();
+    const fuzzyMatch = allNames.find(n => n.startsWith(stripped) || n.includes(stripped));
+    if (fuzzyMatch) return fuzzyMatch;
+
+    return code;
   }
 }
 

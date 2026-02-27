@@ -236,6 +236,74 @@ async function main() {
     throw new Error('No rows found in the Excel file.\nAdd applicant data to: ' + EXCEL_FILE);
   }
 
+  // ── Pre-flight: Check mandatory documents for all applicants ──────────────
+  console.log('\n[DocCheck] ── Validating mandatory documents ──');
+  const MANDATORY_DOCS: Array<{ field: keyof VisaApplication['documents']; label: string }> = [
+    { field: 'sponsoredPassportPage1',   label: 'Sponsored Passport page 1' },
+    { field: 'passportExternalCoverPage', label: 'Passport External Cover Page' },
+    { field: 'personalPhoto',             label: 'Personal Photo' },
+    { field: 'returnAirTicketPage1',      label: 'Return Air Ticket' },
+  ];
+
+  const applicantsWithMissingDocs: Array<{ name: string; passport: string; missing: string[] }> = [];
+  let allDocsOk = true;
+
+  for (const app of allApplications) {
+    const name = app.passport.fullNameEN || '(unknown)';
+    const pp = app.passport.passportNumber || '(no passport)';
+    const missing: string[] = [];
+
+    // Check documents folder exists
+    const folder = app.documents.documentsFolder;
+    if (!folder || !fs.existsSync(folder)) {
+      missing.push('Documents folder missing/not found');
+    }
+
+    for (const { field, label } of MANDATORY_DOCS) {
+      const filePath = app.documents[field] as string;
+      if (!filePath) {
+        missing.push(`${label} (no file mapped)`);
+      } else if (!fs.existsSync(path.resolve(filePath))) {
+        missing.push(`${label} (file not found: ${path.basename(filePath)})`);
+      }
+    }
+
+    // Hotel reservation is optional — passport pic is used as fallback
+    // So we don't flag it as mandatory
+
+    if (missing.length > 0) {
+      allDocsOk = false;
+      applicantsWithMissingDocs.push({ name, passport: pp, missing });
+    }
+  }
+
+  if (allDocsOk) {
+    console.log(`[DocCheck] All ${allApplications.length} applicant(s) have all mandatory documents.`);
+  } else {
+    console.warn(`\n[DocCheck] ⚠ ${applicantsWithMissingDocs.length} applicant(s) have MISSING mandatory documents:\n`);
+    for (const { name, passport, missing } of applicantsWithMissingDocs) {
+      console.warn(`  ${name} (${passport}):`);
+      for (const m of missing) {
+        console.warn(`    - ${m}`);
+      }
+    }
+    console.warn(`\n[DocCheck] These applicants will proceed but uploads may be incomplete.\n`);
+  }
+  console.log('[DocCheck] ── Done ──\n');
+
+  // Filter out applicants missing mandatory docs (only process ready ones)
+  const ONLY_READY = process.env.ONLY_READY !== 'false'; // default: true — only run ready applicants
+  let readyApplications = allApplications;
+  if (ONLY_READY && applicantsWithMissingDocs.length > 0) {
+    const missingPassports = new Set(applicantsWithMissingDocs.map(a => a.passport));
+    readyApplications = allApplications.filter(app => {
+      const pp = app.passport.passportNumber || '(no passport)';
+      return !missingPassports.has(pp);
+    });
+    console.log(`[Init] Filtering to ${readyApplications.length} ready applicant(s) (skipping ${allApplications.length - readyApplications.length} with missing docs)`);
+    console.log(`[Init] To run ALL applicants (including incomplete): ONLY_READY=false npm test`);
+  }
+
   // Skip applicants that already passed (check results.xlsx tracker)
   const alreadyDone = getAlreadyProcessed();
   if (alreadyDone.size > 0) {
@@ -243,7 +311,7 @@ async function main() {
     alreadyDone.forEach(pp => console.log(`  ✓ ${pp}`));
   }
 
-  const applications = allApplications.filter(app => {
+  const applications = readyApplications.filter(app => {
     const passport = app.passport.passportNumber?.trim();
     if (passport && alreadyDone.has(passport)) {
       console.log(`[Init] Skipping ${app.passport.fullNameEN} (${passport}) — already passed`);
