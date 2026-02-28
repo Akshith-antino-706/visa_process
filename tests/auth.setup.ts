@@ -32,7 +32,7 @@ function prompt(question: string): Promise<string> {
 
 async function main() {
   console.log('[Auth] Launching Chrome browser...');
-  const driver = await createDriver();
+  const { driver } = await createDriver();
 
   try {
     // 1. Clear stale cookies and navigate to login

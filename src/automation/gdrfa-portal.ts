@@ -29,14 +29,34 @@ async function compressImageIfNeeded(
   const isImage = ['.jpg', '.jpeg', '.png', '.webp'].includes(ext);
   const isPdf = ext === '.pdf';
 
-  // PDFs: can't compress easily, just pass through (warn if too large)
+  // PDFs: pass through if under limit, otherwise convert first page to JPEG
   if (isPdf) {
-    if (originalBuffer.length > MAX_UPLOAD_BYTES) {
-      console.warn(
-        `[Compress] WARNING: ${originalName} is ${(originalBuffer.length / 1024).toFixed(0)} KB (PDF) — exceeds ${(MAX_UPLOAD_BYTES / 1024).toFixed(0)} KB limit. Portal may reject it.`,
-      );
+    if (originalBuffer.length <= MAX_UPLOAD_BYTES) {
+      return { buffer: originalBuffer, fileName: originalName, mimeType: 'application/pdf' };
     }
-    return { buffer: originalBuffer, fileName: originalName, mimeType: 'application/pdf' };
+    console.warn(
+      `[Compress] ${originalName} is ${(originalBuffer.length / 1024).toFixed(0)} KB (PDF) — exceeds ${(MAX_UPLOAD_BYTES / 1024).toFixed(0)} KB limit. Converting first page to JPEG...`,
+    );
+    try {
+      // sharp can render the first page of a PDF to an image
+      let pdfImage = await sharp(originalBuffer, { density: 150 })
+        .jpeg({ quality: 60, mozjpeg: true })
+        .toBuffer();
+      if (pdfImage.length > MAX_UPLOAD_BYTES) {
+        pdfImage = await sharp(originalBuffer, { density: 100 })
+          .resize({ width: 800, height: 800, fit: 'inside', withoutEnlargement: true })
+          .jpeg({ quality: 40, mozjpeg: true })
+          .toBuffer();
+      }
+      const jpegName = originalName.replace(/\.pdf$/i, '.jpg');
+      console.log(
+        `[Compress] PDF→JPEG: ${(originalBuffer.length / 1024).toFixed(0)} KB → ${(pdfImage.length / 1024).toFixed(0)} KB`,
+      );
+      return { buffer: pdfImage, fileName: jpegName, mimeType: 'image/jpeg' };
+    } catch (pdfErr) {
+      console.warn(`[Compress] PDF→JPEG conversion failed: ${pdfErr}. Passing original PDF.`);
+      return { buffer: originalBuffer, fileName: originalName, mimeType: 'application/pdf' };
+    }
   }
 
   if (!isImage) {
@@ -85,12 +105,21 @@ async function compressImageIfNeeded(
     quality -= 10;
   }
 
-  // If still too large after quality 20, resize more aggressively
+  // If still too large after quality 20, resize more aggressively in steps
   if (compressed.length > MAX_UPLOAD_BYTES) {
-    compressed = await sharp(originalBuffer)
-      .resize({ width: 800, height: 800, fit: 'inside', withoutEnlargement: true })
-      .jpeg({ quality: 25, mozjpeg: true })
-      .toBuffer();
+    for (const dim of [800, 600, 400]) {
+      compressed = await sharp(originalBuffer)
+        .resize({ width: dim, height: dim, fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: 20, mozjpeg: true })
+        .toBuffer();
+      if (compressed.length <= MAX_UPLOAD_BYTES) break;
+    }
+  }
+
+  if (compressed.length > MAX_UPLOAD_BYTES) {
+    console.warn(
+      `[Compress] WARNING: ${originalName} still ${(compressed.length / 1024).toFixed(0)} KB after max compression — portal may reject it.`,
+    );
   }
 
   const compressedName = originalName.replace(/\.\w+$/, '.jpg');
@@ -184,9 +213,17 @@ export class GdrfaPortalPage {
       console.log('\n[Flow] ── Section: Document Upload ──');
       await this.uploadDocuments(application.documents);
 
+      // Verify the application reached "READY TO PAY" status
+      const statusText = await this.verifyReadyToPayStatus();
+      if (!statusText) {
+        throw new Error('[Verify] Application did not reach "READY TO PAY" status after upload.');
+      }
+      console.log(`[Flow] Status confirmed: "${statusText}"`);
+
       // Capture the Application Number from the page
       const appNumber = await this.captureApplicationNumber();
       console.log(`\n[Flow] ─── Application Number: ${appNumber || 'NOT FOUND'} ───\n`);
+
       return appNumber;
     } finally {
       stopKeepAlive();
@@ -273,6 +310,45 @@ export class GdrfaPortalPage {
   }
 
   /**
+   * Checks the page for a "READY TO PAY" (or similar) status badge after submission.
+   * Waits up to 15s since the portal may take a moment to update the status.
+   * Returns the status text if found, or empty string if not.
+   */
+  private async verifyReadyToPayStatus(): Promise<string> {
+    console.log('[Verify] Checking for READY TO PAY status...');
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const statusText = await this.driver.executeScript<string>(`
+        var allEls = document.querySelectorAll('span, div, td, button, a, label, p');
+        for (var i = 0; i < allEls.length; i++) {
+          var t = (allEls[i].textContent || '').trim().toUpperCase();
+          if (t === 'READY TO PAY' || t === 'READYTOPAY' || t === 'READY FOR PAYMENT') {
+            return allEls[i].textContent.trim();
+          }
+        }
+        // Also check for status-like badges/buttons with partial match
+        var badges = document.querySelectorAll('[class*="badge"], [class*="status"], [class*="Status"], [class*="tag"], [class*="Tag"], [class*="btn"]');
+        for (var i = 0; i < badges.length; i++) {
+          var t = (badges[i].textContent || '').trim().toUpperCase();
+          if (t.indexOf('READY') >= 0 && t.indexOf('PAY') >= 0) {
+            return badges[i].textContent.trim();
+          }
+        }
+        return '';
+      `);
+
+      if (statusText) return statusText;
+
+      if (attempt < 4) {
+        console.log(`[Verify] Status not found yet (${attempt + 1}/5)...`);
+        await this.sleep(3000);
+      }
+    }
+
+    return '';
+  }
+
+  /**
    * Uploads documents using OpenAI for intelligent file-to-slot matching,
    * then physically clicks the file input and uses sendKeys to upload each file.
    */
@@ -282,7 +358,7 @@ export class GdrfaPortalPage {
     // Ensure we're on the default content (not stuck in an iframe from popup handling)
     try { await this.driver.switchTo().defaultContent(); } catch {}
     await this.waitForPageLoad();
-    await this.sleep(3000);
+    await this.sleep(1500);
 
     // Log current URL for debugging
     const uploadUrl = await this.driver.getCurrentUrl();
@@ -441,30 +517,36 @@ export class GdrfaPortalPage {
 
     // Log the final document map before uploading
     console.log(`[Upload] Document map (${docMap.length} entries):`);
+    const validDocs: Array<{ label: string; file: string }> = [];
     for (const doc of docMap) {
       const exists = doc.file ? fs.existsSync(path.resolve(doc.file)) : false;
       console.log(`  "${doc.label}" → ${doc.file || '(empty)'} ${exists ? '✓' : '✗ MISSING'}`);
+      if (doc.file && exists) validDocs.push(doc);
+      else if (!doc.file) console.warn(`[Upload] Skipping "${doc.label}" — no file path`);
+      else console.warn(`[Upload] File not found: ${path.resolve(doc.file)}`);
     }
 
-    // Upload each document
+    // Pre-compress ALL files in parallel (saves ~1-2s per file vs sequential)
+    console.log(`[Upload] Pre-compressing ${validDocs.length} files in parallel...`);
+    const compressStart = Date.now();
+    const preCompressed = await Promise.all(
+      validDocs.map(async (doc) => {
+        const { buffer, fileName, mimeType } = await compressImageIfNeeded(path.resolve(doc.file));
+        return { label: doc.label, buffer, fileName, mimeType, base64: buffer.toString('base64') };
+      })
+    );
+    console.log(`[Upload] Pre-compression done in ${((Date.now() - compressStart) / 1000).toFixed(1)}s`);
+
+    // Upload each document with pre-compressed data
     let uploadCount = 0;
-    for (const doc of docMap) {
-      if (!doc.file) {
-        console.warn(`[Upload] Skipping "${doc.label}" — no file path`);
-        continue;
-      }
-      const filePath = path.resolve(doc.file);
-      if (!fs.existsSync(filePath)) {
-        console.warn(`[Upload] File not found: ${filePath}`);
-        continue;
-      }
-      await this.uploadSingleDocument(doc.label, filePath);
+    for (const doc of preCompressed) {
+      await this.uploadSingleDocument(doc.label, doc.base64, doc.fileName, doc.mimeType);
       uploadCount++;
     }
     console.log(`[Upload] Uploaded ${uploadCount}/${docMap.length} documents.`);
 
     console.log('[Upload] All documents sent. Now waiting for Continue button...');
-    await this.sleep(2000);
+    await this.sleep(1000);
 
     // Switch back to default content before looking for Continue button
     if (switchedToIframe) {
@@ -506,8 +588,8 @@ export class GdrfaPortalPage {
    *   → call readUrldoc_N with correct this context
    *   → wait for OsNotify AJAX postback (NOT SaveButton — it causes page navigation)
    */
-  private async uploadSingleDocument(docType: string, filePath: string): Promise<void> {
-    console.log(`[Upload] "${docType}" → ${path.basename(filePath)}`);
+  private async uploadSingleDocument(docType: string, base64Data: string, fileName: string, mimeType: string): Promise<void> {
+    console.log(`[Upload] "${docType}" → ${fileName}`);
 
     // Step 1: Find the card by its title span, then get the file input inside.
     //
@@ -625,23 +707,25 @@ export class GdrfaPortalPage {
     //  ensures the FileReader → OsNotify → server postback always happens.
 
     // Wait for any pending OutSystems AJAX to finish before we start this upload.
-    // OsNotify from a previous upload may still be in-flight. If we fire readUrldoc
-    // while the server is processing the previous postback, the new one gets dropped
-    // because __OSVSTATE is stale.
-    console.log(`[Upload] Waiting for pending AJAX to settle...`);
-    for (let ajaxWait = 0; ajaxWait < 20; ajaxWait++) {
-      const ajaxDone = await this.driver.executeScript<boolean>(`
-        // OutSystems uses jQuery ajax — check if any are pending
-        if (typeof osjs !== 'undefined' && osjs.active > 0) return false;
-        if (typeof jQuery !== 'undefined' && jQuery.active > 0) return false;
-        if (typeof $ !== 'undefined' && $.active > 0) return false;
-        // Also check XMLHttpRequest count via performance entries
-        return true;
-      `);
-      if (ajaxDone) break;
-      await this.sleep(1000);
+    // OsNotify from a previous upload may still be in-flight.
+    const ajaxIdle = await this.driver.executeScript<boolean>(`
+      if (typeof osjs !== 'undefined' && osjs.active > 0) return false;
+      if (typeof jQuery !== 'undefined' && jQuery.active > 0) return false;
+      return true;
+    `);
+    if (!ajaxIdle) {
+      console.log(`[Upload] Waiting for pending AJAX to settle...`);
+      for (let ajaxWait = 0; ajaxWait < 20; ajaxWait++) {
+        const ajaxDone = await this.driver.executeScript<boolean>(`
+          if (typeof osjs !== 'undefined' && osjs.active > 0) return false;
+          if (typeof jQuery !== 'undefined' && jQuery.active > 0) return false;
+          return true;
+        `);
+        if (ajaxDone) break;
+        await this.sleep(500);
+      }
     }
-    await this.sleep(1000);
+    await this.sleep(300);
 
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 2: Inject file into the input via base64 → DataTransfer
@@ -659,10 +743,8 @@ export class GdrfaPortalPage {
     //   - No S3/network dependency
     //   - Works even when the input is hidden/readonly/disabled
 
-    console.log(`[Upload] Reading file (compressing if needed)...`);
-    const { buffer: fileBuffer, fileName, mimeType } = await compressImageIfNeeded(filePath);
-    const base64 = fileBuffer.toString('base64');
-    console.log(`[Upload] File: ${fileName} (${(fileBuffer.length / 1024).toFixed(1)} KB, ${mimeType})`);
+    const base64 = base64Data;
+    console.log(`[Upload] File: ${fileName} (${(Buffer.from(base64, 'base64').length / 1024).toFixed(1)} KB, ${mimeType})`);
 
     const injectResult = await this.driver.executeScript<string>(`
       var inputId = arguments[0];
@@ -693,61 +775,47 @@ export class GdrfaPortalPage {
       console.warn(`[Upload] File injection failed: ${injectResult} — skipping "${docType}"`);
       return;
     }
-    await this.sleep(500);
+    await this.sleep(200);
 
     // ═══════════════════════════════════════════════════════════════════════════
     // STEP 3: Trigger the upload — change event + readUrldoc_N + OsNotify
     // ═══════════════════════════════════════════════════════════════════════════
 
-    // 3a. Dispatch change event (jQuery + native) to fire any bound handlers
-    const changeResult = await this.driver.executeScript<string>(`
-      var fi = document.getElementById(arguments[0]);
-      if (!fi) return 'ERR:input gone';
-      if (!fi.files || !fi.files.length) return 'ERR:no files';
-      var log = 'files=' + fi.files.length + ', name=' + fi.files[0].name + '\\n';
-
-      // jQuery/osjs trigger — fires handlers attached via .bind()/.on()
-      try {
-        if (typeof osjs !== 'undefined' && osjs(fi).trigger) {
-          osjs(fi).trigger('change');
-          log += 'osjs.trigger(change) OK\\n';
-        } else if (typeof jQuery !== 'undefined') {
-          jQuery(fi).trigger('change');
-          log += 'jQuery.trigger(change) OK\\n';
-        }
-      } catch(e) { log += 'jq trigger err: ' + e + '\\n'; }
-
-      // Native change event — fires addEventListener handlers
-      try {
-        fi.dispatchEvent(new Event('change', { bubbles: true }));
-        log += 'native change OK\\n';
-      } catch(e) { log += 'native change err: ' + e + '\\n'; }
-
-      return log;
-    `, fileInputId);
-    console.log(`[Upload] change event: ${changeResult}`);
-    await this.sleep(1500);
-
-    // 3b. ALWAYS call readUrldoc_N manually as the reliable upload trigger.
-    //     The change handler may be detached after prior AJAX refreshes.
-    //     Calling it twice is harmless; NOT calling it is fatal.
-    const callReadUrldoc = async (): Promise<string> => {
+    // 3a. Combined: dispatch change event + call readUrldoc_N in a single JS execution.
+    //     The change handler may be detached after prior AJAX refreshes, so we always
+    //     call readUrldoc_N directly as the reliable upload trigger.
+    const callChangeAndReadUrldoc = async (): Promise<string> => {
       return await this.driver.executeScript<string>(`
         var fi = document.getElementById(arguments[0]);
         var docNum = arguments[1];
         if (!fi) return 'ERR:input gone';
-        if (!fi.files || !fi.files.length) return 'ERR:no files on input';
+        if (!fi.files || !fi.files.length) return 'ERR:no files';
+        var log = 'files=' + fi.files.length + ', name=' + fi.files[0].name + '\\n';
 
-        var log = 'files.length=' + fi.files.length + ', name=' + fi.files[0].name + '\\n';
+        // jQuery/osjs trigger — fires handlers attached via .bind()/.on()
+        try {
+          if (typeof osjs !== 'undefined' && osjs(fi).trigger) {
+            osjs(fi).trigger('change');
+            log += 'osjs.trigger(change) OK\\n';
+          } else if (typeof jQuery !== 'undefined') {
+            jQuery(fi).trigger('change');
+            log += 'jQuery.trigger(change) OK\\n';
+          }
+        } catch(e) { log += 'jq trigger err: ' + e + '\\n'; }
 
+        // Native change event
+        try {
+          fi.dispatchEvent(new Event('change', { bubbles: true }));
+          log += 'native change OK\\n';
+        } catch(e) { log += 'native change err: ' + e + '\\n'; }
+
+        // ALWAYS call readUrldoc_N directly — the reliable upload trigger
         var fnName = 'readUrldoc_' + docNum;
         if (typeof window[fnName] === 'function') {
-          // .call(fi, fi) → 'this' = input element, matching jQuery's behavior
           try { window[fnName].call(fi, fi); log += fnName + '() called OK\\n'; }
           catch(e) { log += fnName + ' error: ' + e + '\\n'; }
         } else {
           log += 'WARN: ' + fnName + ' not found — inline FileReader fallback\\n';
-          // Manual fallback: FileReader → base64 → OsNotify
           try {
             var reader = new FileReader();
             reader.onload = function(ev) {
@@ -771,36 +839,30 @@ export class GdrfaPortalPage {
       `, fileInputId, docNum);
     };
 
-    console.log(`[Upload] Calling readUrldoc_${docNum} → FileReader → OsNotify...`);
-    const readResult = await callReadUrldoc();
-    console.log(`[Upload] readUrldoc: ${readResult}`);
+    console.log(`[Upload] Triggering change + readUrldoc_${docNum}...`);
+    const triggerResult = await callChangeAndReadUrldoc();
+    console.log(`[Upload] trigger: ${triggerResult}`);
 
     // 3c. Wait for FileReader + OsNotify AJAX postback to complete.
-    //     DO NOT click SaveButton — it triggers a full page POST that navigates
-    //     to Application_UploadDocuments.aspx (ERR_ACCESS_DENIED).
-    await this.sleep(3000);
-    console.log(`[Upload] Waiting for OsNotify AJAX postback...`);
+    await this.sleep(1000);
     for (let sw = 0; sw < 15; sw++) {
       const settled = await this.driver.executeScript<boolean>(`
         if (typeof osjs !== 'undefined' && osjs.active > 0) return false;
         if (typeof jQuery !== 'undefined' && jQuery.active > 0) return false;
-        if (typeof $ !== 'undefined' && $.active > 0) return false;
         return true;
       `);
       if (settled) break;
-      await this.sleep(1000);
+      await this.sleep(500);
     }
 
     // Step 4: Wait for the upload to process on the server.
-    //         Check THIS card's btnContainer visibility (changes from display:none to visible).
-    //         The old approach (counting global Download links) was broken because all 23
-    //         Download links exist in DOM already (just hidden with display:none).
+    //         Check THIS card's btnContainer visibility.
     console.log(`[Upload] Waiting for "${docType}" to process...`);
 
     let uploaded = false;
     let retriedReadUrldoc = false;
     for (let attempt = 0; attempt < 15; attempt++) {
-      await this.sleep(2000);
+      // Check FIRST, then sleep (saves one interval on fast uploads)
       const status = await this.driver.executeScript<string>(`
         // Try finding the card by the original element ID first
         var fi = document.getElementById(arguments[0]);
@@ -865,9 +927,9 @@ export class GdrfaPortalPage {
             return true;
           `);
           if (done) break;
-          await this.sleep(1000);
+          await this.sleep(500);
         }
-        await this.sleep(500);
+        await this.sleep(300);
 
         // Re-dispatch change event first (handler may have been re-attached after AJAX refresh)
         await this.driver.executeScript(`
@@ -876,7 +938,7 @@ export class GdrfaPortalPage {
           try { if (typeof osjs !== 'undefined') osjs(fi).trigger('change'); } catch(e) {}
           try { fi.dispatchEvent(new Event('change', { bubbles: true })); } catch(e) {}
         `, fileInputId);
-        await this.sleep(1500);
+        await this.sleep(500);
 
         // Check if the change event retry worked
         const retryWorked = await this.driver.executeScript<boolean>(`
@@ -895,10 +957,10 @@ export class GdrfaPortalPage {
         }
 
         // Still no preview — call readUrldoc_N manually as last resort
-        const retryResult = await callReadUrldoc();
+        const retryResult = await callChangeAndReadUrldoc();
         console.log(`[Upload] readUrldoc retry: ${retryResult}`);
         // Wait for FileReader + OsNotify AJAX postback to complete
-        await this.sleep(3000);
+        await this.sleep(1000);
         for (let sw2 = 0; sw2 < 10; sw2++) {
           const settled = await this.driver.executeScript<boolean>(`
             if (typeof osjs !== 'undefined' && osjs.active > 0) return false;
@@ -906,13 +968,22 @@ export class GdrfaPortalPage {
             return true;
           `);
           if (settled) break;
-          await this.sleep(1000);
+          await this.sleep(500);
         }
         // Do NOT click SaveButton — it triggers a full page POST that navigates away.
         // OsNotify's AJAX postback handles the upload entirely.
       }
 
+      // Accept LABEL_CHANGED as soft success after 3 checks — file IS on server,
+      // UI preview just hasn't rendered yet. Don't waste time waiting.
+      if (attempt >= 3 && status.startsWith('LABEL_CHANGED')) {
+        console.log(`[Upload] "${docType}" — accepting LABEL_CHANGED as soft success (file on server)`);
+        uploaded = true;
+        break;
+      }
+
       console.log(`[Upload] "${docType}" — ${status} (${attempt + 1}/15)`);
+      await this.sleep(1000);
     }
 
     if (!uploaded) {
@@ -929,7 +1000,7 @@ export class GdrfaPortalPage {
 
     // Wait for page to fully settle before next upload
     await this.waitForPageLoad();
-    await this.sleep(2000);
+    await this.sleep(500);
   }
 
   /**
@@ -1012,21 +1083,65 @@ export class GdrfaPortalPage {
 
   private async navigateToNewApplication(): Promise<void> {
     console.log('[Nav] Navigating to Existing Applications...');
-    await this.dismissPromoPopup();
 
-    // Click "Existing Applications"
+    // Retry up to 3 times with page refresh — the dashboard sometimes loads
+    // without rendering the Existing Applications link (AJAX race condition).
     const existAppSel = '#EmaratechSG_Theme_wtwbLayoutEmaratech_block_wtMainContent_wtwbDashboard_wtCntExistApp';
     let clicked = false;
-    try {
-      const el = await this.waitForElement(By.css(existAppSel), 15000);
-      await el.click();
-      clicked = true;
-    } catch {
-      // Fallback: click by link text
+
+    for (let attempt = 0; attempt < 3 && !clicked; attempt++) {
+      if (attempt > 0) {
+        console.log(`[Nav] Retry ${attempt}/2 — refreshing dashboard page...`);
+        await this.driver.get(GdrfaPortalPage.HOME);
+        await this.waitForPageLoad();
+        await this.sleep(3000);
+      }
+
+      await this.dismissPromoPopup();
+
+      // Strategy 1: Direct ID selector
+      try {
+        const el = await this.waitForElement(By.css(existAppSel), 15000);
+        if (await el.isDisplayed().catch(() => false)) {
+          await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', el);
+          await this.sleep(300);
+          try {
+            await el.click();
+          } catch {
+            await this.driver.executeScript('arguments[0].click();', el);
+          }
+          clicked = true;
+          continue;
+        }
+      } catch {}
+
+      // Strategy 2: Partial link text
       try {
         const link = await this.driver.findElement(By.partialLinkText('Existing Applications'));
-        await link.click();
-        clicked = true;
+        if (await link.isDisplayed().catch(() => false)) {
+          await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', link);
+          await this.sleep(300);
+          await link.click();
+          clicked = true;
+          continue;
+        }
+      } catch {}
+
+      // Strategy 3: JS click any element containing the text
+      try {
+        const jsClicked = await this.driver.executeScript<boolean>(`
+          var els = document.querySelectorAll('a, span, div, button');
+          for (var i = 0; i < els.length; i++) {
+            var t = (els[i].textContent || '').trim();
+            if (t === 'Existing Applications' || t === 'existing applications') {
+              els[i].scrollIntoView({block:'center'});
+              els[i].click();
+              return true;
+            }
+          }
+          return false;
+        `);
+        if (jsClicked) { clicked = true; continue; }
       } catch {}
     }
 
@@ -1242,7 +1357,8 @@ export class GdrfaPortalPage {
       }
     } catch {}
 
-    // ── Step 2: Scroll into view and click the dropdown open ──
+    // ── Step 2: Clear overlays, scroll into view and click the dropdown open ──
+    await this.clearBlockingOverlays();
     await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', container);
     await this.sleep(300);
 
@@ -1613,7 +1729,8 @@ export class GdrfaPortalPage {
   }
 
   private async clickSearchDataAndWait(): Promise<void> {
-    // Close any lingering Select2 dropdowns that might intercept the click
+    // Clear overlays and Select2 dropdowns that might intercept the click
+    await this.clearBlockingOverlays();
     await this.closeOpenSelect2Dropdowns();
     await this.sleep(300);
 
@@ -2050,53 +2167,85 @@ export class GdrfaPortalPage {
 
     if (contact.uaeEmirate) {
       console.log(`[Form] Setting Emirate: "${contact.uaeEmirate}"...`);
+      await this.closeOpenSelect2Dropdowns();
       const emResult = await this.selectByStaticId('cmbAddressInsideEmiratesId', contact.uaeEmirate);
       if (emResult.skipped) {
         console.log(`[Skip] Emirate already set: "${emResult.matched}".`);
       } else if (emResult.found) {
         await this.waitForPageLoad();
+        await this.sleep(500);
         console.log(`[Form] Emirate set: "${emResult.matched}".`);
       } else {
-        console.warn(`[Form] Emirate not found for: "${contact.uaeEmirate}".`);
+        // Fallback: physical Select2 click
+        console.log(`[Form] Emirate programmatic failed — trying Select2 click...`);
+        const clickResult = await this.clickSelect2ByLabel('Emirates', contact.uaeEmirate);
+        if (clickResult) {
+          await this.waitForPageLoad();
+          console.log(`[Form] Emirate set via Select2 click.`);
+        } else {
+          console.warn(`[Form] Emirate not found for: "${contact.uaeEmirate}".`);
+        }
       }
     }
 
     if (contact.uaeCity) {
       console.log(`[Form] Setting City: "${contact.uaeCity}"...`);
+      await this.closeOpenSelect2Dropdowns();
       await this.waitForCondition(async () => {
         return this.driver.executeScript<boolean>(`
           var sel = document.querySelector('select[data-staticid="cmbAddressInsideCityId"]');
           return sel ? sel.options.length > 1 : false;
         `);
-      }, 10000).catch(() => console.warn('[Form] City dropdown did not populate in time.'));
-      const cityResult = await this.selectByStaticId('cmbAddressInsideCityId', contact.uaeCity);
+      }, 15000).catch(() => console.warn('[Form] City dropdown did not populate in time.'));
+      await this.sleep(500);
+      const cityResult = await this.selectByStaticId('cmbAddressInsideCityId', contact.uaeCity, 3);
       if (cityResult.skipped) {
         console.log(`[Skip] City already set: "${cityResult.matched}".`);
       } else if (cityResult.found) {
         await this.waitForPageLoad();
+        await this.sleep(500);
         console.log(`[Form] City set: "${cityResult.matched}".`);
       } else {
-        console.warn(`[Form] City not found for: "${contact.uaeCity}".`);
+        // Fallback: physical Select2 click
+        console.log(`[Form] City programmatic failed — trying Select2 click...`);
+        const clickResult = await this.clickSelect2ByLabel('City', contact.uaeCity);
+        if (clickResult) {
+          await this.waitForPageLoad();
+          console.log(`[Form] City set via Select2 click.`);
+        } else {
+          console.warn(`[Form] City not found for: "${contact.uaeCity}".`);
+        }
       }
     }
 
     // Area dropdown (depends on City AJAX, so placed after City but before text fields)
     if (contact.uaeArea) {
       console.log(`[Form] Setting Area: "${contact.uaeArea}"...`);
+      // Wait longer for Area — it's a cascading dropdown that depends on City AJAX
       await this.waitForCondition(async () => {
         return this.driver.executeScript<boolean>(`
           var sel = document.querySelector('select[data-staticid="cmbAddressInsideAreaId"]');
           return sel ? sel.options.length > 1 : false;
         `);
-      }, 10000).catch(() => console.warn('[Form] Area dropdown did not populate in time.'));
-      const areaResult = await this.selectByStaticId('cmbAddressInsideAreaId', contact.uaeArea);
+      }, 15000).catch(() => console.warn('[Form] Area dropdown did not populate in time.'));
+      await this.sleep(500);
+
+      // First attempt: programmatic selection (with built-in retries)
+      const areaResult = await this.selectByStaticId('cmbAddressInsideAreaId', contact.uaeArea, 3);
       if (areaResult.skipped) {
         console.log(`[Skip] Area already set: "${areaResult.matched}".`);
       } else if (areaResult.found) {
         await this.waitForPageLoad();
         console.log(`[Form] Area set: "${areaResult.matched}".`);
       } else {
-        console.warn(`[Form] Area not found for: "${contact.uaeArea}".`);
+        // Fallback: use physical Select2 click interaction
+        console.log(`[Form] Area programmatic failed — trying physical Select2 click...`);
+        const clickResult = await this.clickSelect2ByLabel('Area', contact.uaeArea);
+        if (clickResult) {
+          console.log(`[Form] Area set via Select2 click.`);
+        } else {
+          console.warn(`[Form] Area not found for: "${contact.uaeArea}".`);
+        }
       }
     }
 
@@ -2532,13 +2681,22 @@ export class GdrfaPortalPage {
 
   private async clickContinue(): Promise<void> {
     console.log('[Form] Clicking Continue...');
+    await this.clearBlockingOverlays();
+    await this.closeOpenSelect2Dropdowns();
+    await this.sleep(300);
     const btn = await this.driver.wait(
       until.elementLocated(By.css('input[staticid="SmartChannels_EntryPermitNewTourism_btnContinue"]')),
       10000,
       'Continue button not found within 10s',
     );
     await this.driver.executeScript('arguments[0].scrollIntoView({block:"center"});', btn);
-    await btn.click();
+    await this.sleep(300);
+    try {
+      await btn.click();
+    } catch {
+      console.log('[Form] Continue native click blocked — using JS click...');
+      await this.driver.executeScript('arguments[0].click();', btn);
+    }
     console.log('[Form] Continue clicked — waiting for popup or next page...');
 
     // Brief pause so the portal has time to show the popup or the loader
@@ -2830,49 +2988,73 @@ export class GdrfaPortalPage {
 
   private async selectByStaticId(
     staticId: string,
-    searchValue: string
+    searchValue: string,
+    retries: number = 2
   ): Promise<{ found: boolean; matched: string; skipped?: boolean }> {
-    return this.driver.executeScript<{ found: boolean; matched: string; skipped?: boolean }>(`
-      var id = arguments[0];
-      var search = arguments[1];
-      var sel = document.querySelector('select[data-staticid="' + id + '"]');
-      if (!sel) return { found: false, matched: '' };
+    // Close any stale Select2 dropdowns first
+    await this.closeOpenSelect2Dropdowns();
 
-      var currentText = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].text.trim() : '';
-      if (currentText && currentText.indexOf('Select') < 0 &&
-          (currentText.toUpperCase() === search.toUpperCase() ||
-           currentText.toUpperCase().indexOf(search.toUpperCase()) >= 0)) {
-        return { found: true, matched: currentText, skipped: true };
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      const result = await this.driver.executeScript<{ found: boolean; matched: string; skipped?: boolean }>(`
+        var id = arguments[0];
+        var search = arguments[1];
+        var sel = document.querySelector('select[data-staticid="' + id + '"]');
+        if (!sel) return { found: false, matched: '' };
+
+        var currentText = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].text.trim() : '';
+        if (currentText && currentText.indexOf('Select') < 0 &&
+            (currentText.toUpperCase() === search.toUpperCase() ||
+             currentText.toUpperCase().indexOf(search.toUpperCase()) >= 0)) {
+          return { found: true, matched: currentText, skipped: true };
+        }
+
+        var s2 = sel.closest('.select2-container')
+          || (sel.previousElementSibling && sel.previousElementSibling.classList.contains('select2-container') ? sel.previousElementSibling : null)
+          || (sel.nextElementSibling && sel.nextElementSibling.classList.contains('select2-container') ? sel.nextElementSibling : null)
+          || document.getElementById('s2id_' + sel.id);
+        if (s2) {
+          s2.classList.remove('ReadOnly');
+          s2.querySelectorAll('.ReadOnly').forEach(function(el) { el.classList.remove('ReadOnly'); });
+          // Also unlock parent chain
+          var p = s2.parentElement;
+          for (var k = 0; k < 5 && p; k++) { p.classList.remove('ReadOnly'); p = p.parentElement; }
+        }
+        sel.removeAttribute('disabled');
+        sel.removeAttribute('readonly');
+
+        var opts = Array.from(sel.options);
+        var match = opts.find(function(o) { return o.text.trim().toUpperCase() === search.toUpperCase(); })
+          || opts.find(function(o) { return o.text.toUpperCase().indexOf(search.toUpperCase()) >= 0; });
+        if (!match) return { found: false, matched: '', optionCount: opts.length };
+
+        sel.value = '';
+        sel.value = match.value;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+
+        var jq = window.jQuery || window.$;
+        if (jq) {
+          jq(sel).val(match.value).trigger('change');
+          jq(sel).trigger({ type: 'select2:select', params: { data: { id: match.value, text: match.text } } });
+        }
+        if (s2) {
+          var chosen = s2.querySelector('.select2-chosen');
+          if (chosen) chosen.textContent = match.text.trim();
+        }
+
+        return { found: true, matched: match.text };
+      `, staticId, searchValue);
+
+      if (result.found) return result;
+
+      // If not found and we have retries left, wait for AJAX and try again
+      if (attempt < retries) {
+        console.log(`[Select2] "${staticId}" — option "${searchValue}" not found (attempt ${attempt + 1}), waiting for AJAX...`);
+        await this.sleep(2000);
+        await this.waitForPageLoad();
       }
+    }
 
-      var s2 = sel.closest('.select2-container')
-        || (sel.previousElementSibling && sel.previousElementSibling.classList.contains('select2-container') ? sel.previousElementSibling : null)
-        || (sel.nextElementSibling && sel.nextElementSibling.classList.contains('select2-container') ? sel.nextElementSibling : null)
-        || document.getElementById('s2id_' + sel.id);
-      if (s2) {
-        s2.classList.remove('ReadOnly');
-        s2.querySelectorAll('.ReadOnly').forEach(function(el) { el.classList.remove('ReadOnly'); });
-      }
-      sel.removeAttribute('disabled');
-
-      var opts = Array.from(sel.options);
-      var match = opts.find(function(o) { return o.text.trim().toUpperCase() === search.toUpperCase(); })
-        || opts.find(function(o) { return o.text.toUpperCase().indexOf(search.toUpperCase()) >= 0; });
-      if (!match) return { found: false, matched: '' };
-
-      sel.value = '';
-      sel.value = match.value;
-      sel.dispatchEvent(new Event('change', { bubbles: true }));
-
-      var jq = window.jQuery || window.$;
-      if (jq) { jq(sel).val(match.value).trigger('change'); }
-      if (s2) {
-        var chosen = s2.querySelector('.select2-chosen');
-        if (chosen) chosen.textContent = match.text.trim();
-      }
-
-      return { found: true, matched: match.text };
-    `, staticId, searchValue);
+    return { found: false, matched: '' };
   }
 
   private async selectByAjaxSelect2(
@@ -3116,6 +3298,34 @@ export class GdrfaPortalPage {
       await this.sleep(250);
     }
     throw new Error(`Condition not met within ${timeout}ms`);
+  }
+
+  /** Remove all blocking overlays, modals, popups, and stuck loaders that intercept clicks. */
+  private async clearBlockingOverlays(): Promise<void> {
+    await this.driver.executeScript(`
+      // 1. Hide OutSystems loader overlays
+      document.querySelectorAll('.os-loading-overlay, .Feedback_AjaxWait, .loading-overlay').forEach(function(el) {
+        el.style.display = 'none';
+        el.style.visibility = 'hidden';
+      });
+      // 2. Remove generic modal backdrops
+      document.querySelectorAll('.modal-backdrop, .popup-overlay, .overlay').forEach(function(el) {
+        if (el.offsetHeight > 0) {
+          el.style.display = 'none';
+        }
+      });
+      // 3. Remove any absolutely positioned element with high z-index blocking the page
+      document.querySelectorAll('[style*="z-index"]').forEach(function(el) {
+        var z = parseInt(window.getComputedStyle(el).zIndex, 10);
+        var pos = window.getComputedStyle(el).position;
+        if (z > 1000 && (pos === 'fixed' || pos === 'absolute') && el.offsetWidth > 200 && el.offsetHeight > 200) {
+          // Likely a blocking overlay — hide it
+          if (!el.querySelector('input') && !el.querySelector('select') && !el.querySelector('table')) {
+            el.style.display = 'none';
+          }
+        }
+      });
+    `);
   }
 
   /** Close any open Select2 dropdowns to prevent them from blocking clicks on other elements. */

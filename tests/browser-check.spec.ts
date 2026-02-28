@@ -7,7 +7,7 @@ import { createDriver, quitDriver } from '../src/automation/driver-factory';
 
 async function main() {
   console.log('[Check] Launching browser...');
-  const driver = await createDriver();
+  const { driver, profileDir } = await createDriver();
 
   try {
     console.log('[Check] Going to Google...');
@@ -20,7 +20,7 @@ async function main() {
     }
     console.log('[Check] PASSED');
   } finally {
-    await quitDriver(driver);
+    await quitDriver(driver, profileDir);
   }
 }
 

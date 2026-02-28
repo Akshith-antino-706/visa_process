@@ -43,7 +43,7 @@ async function takeScreenshot(driver: WebDriver, filePath: string): Promise<void
 
 // ─── Results Excel Tracker ──────────────────────────────────────────────────
 
-const TRACKER_HEADERS = ['Applicant Name', 'Passport Number', 'Application Number', 'Status', 'Error', 'Duration', 'Timestamp'];
+const TRACKER_HEADERS = ['Applicant Name', 'Passport Number', 'Application Number', 'Status', 'Error', 'Duration', 'Timestamp', 'Screenshot'];
 
 /** Read existing tracker rows from results.xlsx (returns empty array if file doesn't exist) */
 function readTracker(): string[][] {
@@ -98,6 +98,8 @@ function getAlreadyProcessed(): Set<string> {
 
 // ─── Worker function ─────────────────────────────────────────────────────────
 
+const MAX_RETRIES = parseInt(process.env.RETRIES || '1', 10); // retry failed applications once by default
+
 async function processApplication(
   application: VisaApplication,
   index: number,
@@ -105,70 +107,100 @@ async function processApplication(
 ): Promise<{ label: string; status: 'passed' | 'failed'; error?: string; duration: number; applicationNumber?: string }> {
   const label  = `applicant-${padIndex(index, total)}`;
   const prefix = `[Applicant ${index + 1}/${total} — ${label}]`;
-  const start  = Date.now();
 
-  let driver: WebDriver | null = null;
+  for (let attempt = 1; attempt <= 1 + MAX_RETRIES; attempt++) {
+    const start = Date.now();
+    let driver: WebDriver | null = null;
+    let profileDir: string | undefined;
 
-  try {
-    console.log(`\n${prefix} Starting — creating browser...`);
-    driver = await createDriver();
-    await loadSession(driver);
+    try {
+      if (attempt > 1) console.log(`\n${prefix} RETRY attempt ${attempt}/${1 + MAX_RETRIES}...`);
+      else console.log(`\n${prefix} Starting — creating browser...`);
 
-    console.log(
-      `${prefix} Filling form for: ` +
-      `${application.passport.fullNameEN} | ${application.passport.passportNumber}`
-    );
+      const created = await createDriver();
+      driver = created.driver;
+      profileDir = created.profileDir;
+      await loadSession(driver);
 
-    const applicationNumber = await fillApplicationForm(driver, application);
+      console.log(
+        `${prefix} Filling form for: ` +
+        `${application.passport.fullNameEN} | ${application.passport.passportNumber}`
+      );
 
-    ensureDir('test-results');
-    await takeScreenshot(driver, `test-results/${label}-complete.png`);
-    console.log(`${prefix} Screenshot saved.`);
+      const applicationNumber = await fillApplicationForm(driver, application);
 
-    const duration = Date.now() - start;
-    console.log(`${prefix} PASSED — Application #: ${applicationNumber || 'N/A'} (${(duration / 1000).toFixed(1)}s)`);
-
-    // Write to results tracker immediately
-    appendToTracker([
-      application.passport.fullNameEN,
-      application.passport.passportNumber,
-      applicationNumber || '',
-      'passed',
-      '',
-      `${(duration / 1000).toFixed(1)}s`,
-      new Date().toISOString(),
-    ]);
-    console.log(`${prefix} Result saved to ${RESULTS_XLSX}`);
-
-    return { label, status: 'passed', duration, applicationNumber };
-  } catch (err: any) {
-    const duration = Date.now() - start;
-    const errorMsg = err?.message ?? String(err);
-    console.error(`${prefix} FAILED: ${errorMsg}`);
-
-    // Save error screenshot
-    if (driver) {
       ensureDir('test-results');
-      await takeScreenshot(driver, `test-results/${label}-error.png`);
-    }
+      const screenshotFile = `${label}-complete.png`;
+      await takeScreenshot(driver, `test-results/${screenshotFile}`);
+      console.log(`${prefix} Screenshot saved.`);
 
-    // Write failure to results tracker
-    appendToTracker([
-      application.passport.fullNameEN,
-      application.passport.passportNumber,
-      '',
-      'failed',
-      errorMsg.slice(0, 200),
-      `${(duration / 1000).toFixed(1)}s`,
-      new Date().toISOString(),
-    ]);
+      const duration = Date.now() - start;
+      console.log(`${prefix} PASSED — Application #: ${applicationNumber || 'N/A'} (${(duration / 1000).toFixed(1)}s)`);
 
-    return { label, status: 'failed', error: errorMsg, duration };
-  } finally {
-    if (driver) {
-      await quitDriver(driver);
+      // Write to results tracker immediately
+      appendToTracker([
+        application.passport.fullNameEN,
+        application.passport.passportNumber,
+        applicationNumber || '',
+        'passed',
+        '',
+        `${(duration / 1000).toFixed(1)}s`,
+        new Date().toISOString(),
+        screenshotFile,
+      ]);
+      console.log(`${prefix} Result saved to ${RESULTS_XLSX}`);
+
+      return { label, status: 'passed', duration, applicationNumber };
+    } catch (err: any) {
+      const duration = Date.now() - start;
+      const errorMsg = err?.message ?? String(err);
+      const isCrash = errorMsg.includes('session deleted') || errorMsg.includes('disconnected') ||
+                       errorMsg.includes('ECONNREFUSED') || errorMsg.includes('no such session') ||
+                       errorMsg.includes('target window already closed') || errorMsg.includes('chrome not reachable');
+
+      console.error(`${prefix} FAILED (attempt ${attempt}): ${errorMsg}`);
+
+      // Save error screenshot
+      const errorScreenshotFile = `${label}-error.png`;
+      if (driver) {
+        ensureDir('test-results');
+        await takeScreenshot(driver, `test-results/${errorScreenshotFile}`).catch(() => {});
+      }
+
+      // If this was a crash and we have retries left, retry with a fresh browser
+      if (isCrash && attempt <= MAX_RETRIES) {
+        console.log(`${prefix} Browser crashed — will retry with fresh instance...`);
+        if (driver) await quitDriver(driver, profileDir);
+        await sleep(2000); // Brief cooldown before retry
+        continue;
+      }
+
+      // Final attempt — write failure to tracker
+      appendToTracker([
+        application.passport.fullNameEN,
+        application.passport.passportNumber,
+        '',
+        'failed',
+        errorMsg.slice(0, 200),
+        `${(duration / 1000).toFixed(1)}s`,
+        new Date().toISOString(),
+        errorScreenshotFile,
+      ]);
+
+      return { label, status: 'failed', error: errorMsg, duration };
+    } finally {
+      if (driver) {
+        await quitDriver(driver, profileDir);
+      }
     }
   }
+
+  // Should never reach here, but TypeScript needs it
+  return { label, status: 'failed', error: 'Unknown error', duration: 0 };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // ─── Worker Pool ─────────────────────────────────────────────────────────────
@@ -182,7 +214,18 @@ async function runWorkerPool(
 
   const workers: Promise<void>[] = [];
 
-  async function worker(): Promise<void> {
+  // Stagger delay between worker launches to prevent resource contention.
+  // Each Chrome instance needs ~300-400MB RAM; launching all at once causes crashes.
+  const STAGGER_DELAY_MS = parseInt(process.env.STAGGER_MS || '3000', 10);
+
+  async function worker(workerNum: number): Promise<void> {
+    // Stagger startup: wait progressively longer for each worker
+    if (workerNum > 0) {
+      const delay = workerNum * STAGGER_DELAY_MS;
+      console.log(`[Pool] Worker ${workerNum + 1} waiting ${(delay / 1000).toFixed(0)}s before starting...`);
+      await sleep(delay);
+    }
+
     while (nextIndex < applications.length) {
       const idx = nextIndex++;
       const result = await processApplication(applications[idx], idx, applications.length);
@@ -192,10 +235,11 @@ async function runWorkerPool(
 
   // Spawn up to maxWorkers concurrent workers
   const workerCount = Math.min(maxWorkers, applications.length);
-  console.log(`\n[Pool] Spawning ${workerCount} parallel workers for ${applications.length} application(s)...\n`);
+  console.log(`\n[Pool] Spawning ${workerCount} parallel workers for ${applications.length} application(s)...`);
+  console.log(`[Pool] Stagger delay: ${STAGGER_DELAY_MS}ms between workers\n`);
 
   for (let i = 0; i < workerCount; i++) {
-    workers.push(worker());
+    workers.push(worker(i));
   }
 
   await Promise.all(workers);
@@ -210,6 +254,19 @@ async function main() {
   console.log(`[Init] Session: ${SESSION_FILE} (exists: ${fs.existsSync(SESSION_FILE)})`);
   console.log(`[Init] Excel:   ${EXCEL_FILE} (exists: ${fs.existsSync(EXCEL_FILE)})`);
   console.log(`[Init] Max parallel workers: ${MAX_WORKERS}`);
+
+  // Clean up stale temp profiles from previous runs
+  try {
+    const profilesDir = '/tmp/selenium-profiles';
+    if (fs.existsSync(profilesDir)) {
+      const staleProfiles = fs.readdirSync(profilesDir);
+      if (staleProfiles.length > 0) {
+        console.log(`[Init] Cleaning ${staleProfiles.length} stale Chrome profile(s)...`);
+        fs.rmSync(profilesDir, { recursive: true, force: true });
+        fs.mkdirSync(profilesDir, { recursive: true });
+      }
+    }
+  } catch { /* best effort */ }
 
   // Pre-flight checks
   if (!fs.existsSync(SESSION_FILE)) {

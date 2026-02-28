@@ -18,7 +18,7 @@ function prompt(question: string): Promise<string> {
 
 async function main() {
   console.log('[Launch] Creating browser with session...');
-  const driver = await createDriver();
+  const { driver } = await createDriver();
 
   try {
     await loadSession(driver, SESSION_FILE);

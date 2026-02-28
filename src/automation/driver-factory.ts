@@ -29,7 +29,7 @@ export interface SessionData {
  * Creates a new Chrome WebDriver instance in headed mode (maximized).
  * Uses a dedicated temp profile in /tmp to stay fully isolated from user's Chrome.
  */
-export async function createDriver(): Promise<WebDriver> {
+export async function createDriver(): Promise<{ driver: WebDriver; profileDir: string }> {
   const options = new chrome.Options();
 
   // Core stability flags
@@ -38,6 +38,23 @@ export async function createDriver(): Promise<WebDriver> {
   options.addArguments('--disable-gpu');
   options.addArguments('--start-maximized');
   options.addArguments('--lang=en-US');
+
+  // Prevent Chrome from throttling background tabs/windows (critical for parallel workers)
+  options.addArguments('--disable-background-timer-throttling');
+  options.addArguments('--disable-backgrounding-occluded-windows');
+  options.addArguments('--disable-renderer-backgrounding');
+
+  // Prevent Chrome from killing tabs it thinks are flooding IPC channels
+  options.addArguments('--disable-ipc-flooding-protection');
+
+  // Reduce memory per instance (important for 20 parallel workers)
+  options.addArguments('--renderer-process-limit=1');
+  options.addArguments('--disable-extensions');
+  options.addArguments('--disable-default-apps');
+  options.addArguments('--disable-popup-blocking');
+
+  // Disable unnecessary features that consume memory
+  options.addArguments('--disable-features=OptimizationGuideModelDownloading,OptimizationHintsFetching,OptimizationTargetPrediction,OptimizationHints,TranslateUI');
 
   // Dedicated temp profile — completely isolated from user's Chrome
   const tmpDir = `/tmp/selenium-profiles/profile-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -56,7 +73,7 @@ export async function createDriver(): Promise<WebDriver> {
     script: 30000,
   });
 
-  return driver;
+  return { driver, profileDir: tmpDir };
 }
 
 /**
@@ -160,10 +177,19 @@ export async function saveSession(driver: WebDriver, sessionFile = SESSION_FILE)
 /**
  * Safely quits a driver and cleans up its temporary profile.
  */
-export async function quitDriver(driver: WebDriver): Promise<void> {
+export async function quitDriver(driver: WebDriver, profileDir?: string): Promise<void> {
   try {
     await driver.quit();
   } catch {
     // Driver may already be closed
+  }
+
+  // Clean up temp profile to free disk space (important for 20+ workers over many runs)
+  if (profileDir && fs.existsSync(profileDir)) {
+    try {
+      fs.rmSync(profileDir, { recursive: true, force: true });
+    } catch {
+      // Best effort cleanup
+    }
   }
 }
